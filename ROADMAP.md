@@ -16,9 +16,14 @@ A privacy-first identity vault that lets users:
 
 **Not intended for:** impersonation, KYC bypass, forged identity documents, reference-image cloning, or evasive abuse automation.
 
-## Current State (v2.0)
+## Current State (v2.1)
 
-- Browser extension (Chrome + Firefox MV3) with PQC crypto, vault UI, popup, content script, onboarding
+- Browser extension (Chrome + Firefox 128+ MV3) with PQC crypto, vault UI, popup, content script, onboarding
+- **Passkeys:** the extension is a real WebAuthn authenticator — it creates ES256
+  credentials, stores the private keys in the encrypted vault, and signs
+  assertions. See `docs/passkeys.md`
+- **Identities without AI:** personas can be created and edited by hand;
+  generation is an optional convenience over the same editor
 - 14 API endpoints under `/v1/` in `vaultwares-api` (auth, vault CRUD, sync, devices)
 - Zero-knowledge encryption: ML-KEM-768, ML-DSA-65, AES-256-GCM, Argon2id KDF
 - Encrypted local cache with sync-ready records
@@ -40,6 +45,9 @@ A privacy-first identity vault that lets users:
 - [x] Popup: quick gen behind button, autofill from popup, new item from current tab
 - [x] Content script: AUTOFILL message listener for popup-triggered fill
 - [x] Identity management: Identity type, encrypted storage, AI generation (Ollama JSON), identity-first vault UI, popup grouping by identity, content script identity grouping, item-to-identity assignment, lastUsedAt tracking
+- [x] Manual identity creation and editing (no generation endpoint required)
+- [x] WebAuthn authenticator: `navigator.credentials` interception, ES256 keygen, CBOR attestation, DER assertion signing, in-page consent, browser fallback
+- [x] Field detection rewrite: shadow-DOM traversal, MutationObserver rescan for SPA forms, per-form scoping, keyboard navigation, save-login prompt
 
 ### Phase 2 — Integration
 

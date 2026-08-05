@@ -1,317 +1,361 @@
-interface FormField {
-    element: HTMLInputElement;
-    role: string;
-    confidence: number;
+/**
+ * Page agent: detects credential forms, offers vault entries, fills them, and
+ * offers to save what the user submits.
+ *
+ * Runs at document_idle in the isolated world. The passkey authenticator is a
+ * separate pair of scripts (`webauthn-inject` / `webauthn-bridge`) because it
+ * has to be in place at document_start.
+ */
+
+import {
+    detectForms,
+    formForElement,
+    fillForm,
+    isVisible,
+    type DetectedForm,
+    type DetectedField,
+    type FieldRole,
+} from './detect';
+import { showMenu, closeMenu, isMenuOpen } from './menu';
+import { showSavePrompt } from './save-prompt';
+import { t } from '../i18n/strings';
+import type { VaultItem, LoginItem, CardItem, AddressItem, PasskeyItem, VaultSettings } from '../types';
+
+const RESCAN_DEBOUNCE_MS = 300;
+const PROACTIVE_DELAY_MS = 700;
+
+/** Roles worth opening the menu for when focused. */
+const TRIGGER_ROLES: ReadonlySet<FieldRole> = new Set<FieldRole>([
+    'username', 'email', 'password', 'newPassword', 'totp', 'cardNumber',
+]);
+
+interface PendingSaveDecision {
+    status: 'new' | 'existing' | 'locked';
+    itemId?: string;
+    samePassword?: boolean;
 }
 
-interface FormDetectionResult {
-    type: 'login' | 'signup' | 'none';
-    fields: FormField[];
-    score: number;
-}
-
-function detectFieldType(input: HTMLInputElement): string {
-    const hints = [
-        input.name, input.id, input.getAttribute('autocomplete') ?? '',
-        input.getAttribute('placeholder') ?? '', input.type,
-    ].join(' ').toLowerCase();
-
-    if (/first.?name/.test(hints)) return 'firstName';
-    if (/last.?name/.test(hints)) return 'lastName';
-    if (/full.?name|^name$/.test(hints)) return 'fullName';
-    if (/confirm.*pass|pass.*confirm|repeat.*pass/.test(hints)) return 'passwordConfirm';
-    if (/pass|pwd/.test(hints) || input.type === 'password') return 'password';
-    if (/email|e-mail/.test(hints)) return 'email';
-    if (/user|handle|login/.test(hints) && input.type !== 'password') return 'username';
-    if (/phone|tel|mobile/.test(hints)) return 'phone';
-    if (/birth|dob/.test(hints)) return 'birthDate';
-    if (/street|address/.test(hints)) return 'street';
-    if (/city/.test(hints)) return 'city';
-    if (/state|province/.test(hints)) return 'state';
-    if (/zip|postal/.test(hints)) return 'zipCode';
-    if (/country/.test(hints)) return 'country';
-    if (/card.?number|cc.?num/.test(hints)) return 'cardNumber';
-    if (/cvc|cvv|security.?code/.test(hints)) return 'cvv';
-    if (/expir/.test(hints)) return 'expiry';
-    if (/otp|totp|2fa|verification.?code/.test(hints)) return 'totp';
-    return 'unknown';
-}
-
-function detectForms(): FormDetectionResult {
-    const inputs = Array.from(document.querySelectorAll<HTMLInputElement>(
-        'input:not([type=hidden]):not([type=submit]):not([type=button]):not([type=checkbox]):not([type=radio])',
-    ));
-
-    if (inputs.length === 0) return { type: 'none', fields: [], score: 0 };
-
-    const fields: FormField[] = inputs.map(input => ({
-        element: input,
-        role: detectFieldType(input),
-        confidence: 1,
-    }));
-
-    const hasPassword = fields.some(f => f.role === 'password');
-    const hasEmail = fields.some(f => f.role === 'email');
-    const hasConfirmPassword = fields.some(f => f.role === 'passwordConfirm');
-    const hasFirstName = fields.some(f => f.role === 'firstName' || f.role === 'fullName');
-    const hasUsername = fields.some(f => f.role === 'username');
-
-    let type: 'login' | 'signup' | 'none' = 'none';
-    let score = 0;
-
-    if (hasPassword && hasConfirmPassword) {
-        type = 'signup';
-        score = 90;
-    } else if (hasPassword && hasFirstName) {
-        type = 'signup';
-        score = 80;
-    } else if (hasPassword && (hasEmail || hasUsername)) {
-        type = 'login';
-        score = 85;
-    } else if (hasPassword) {
-        type = 'login';
-        score = 60;
-    }
-
-    return { type, fields, score };
-}
-
-function createInlineMenu(): HTMLElement | null {
-    const existing = document.getElementById('vw-inline-menu');
-    if (existing) existing.remove();
-
-    const detection = detectForms();
-    if (detection.type === 'none' || detection.score < 50) return null;
-
-    const menu = document.createElement('div');
-    menu.id = 'vw-inline-menu';
-    menu.style.cssText = `
-        position: fixed;
-        z-index: 2147483647;
-        background: #13101c;
-        border: 1px solid rgba(255,255,255,0.06);
-        border-radius: 12px;
-        box-shadow: 0 8px 32px rgba(0,0,0,0.5);
-        font-family: 'Inter', 'Segoe UI', system-ui, sans-serif;
-        color: #a394cc;
-        min-width: 280px;
-        max-width: 360px;
-        padding: 8px;
-        display: none;
-    `;
-
-    const header = document.createElement('div');
-    header.style.cssText = 'padding: 8px 12px; font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: #D6A441;';
-    header.textContent = detection.type === 'login' ? 'VaultWares — Logins' : 'VaultWares — Sign Up';
-    menu.appendChild(header);
-
-    const listContainer = document.createElement('div');
-    listContainer.id = 'vw-inline-menu-list';
-    menu.appendChild(listContainer);
-
-    document.body.appendChild(menu);
-    return menu;
-}
-
-function createNoMatchesItem(menu: HTMLElement, listContainer: HTMLElement): void {
-    const noMatches = document.createElement('div');
-    noMatches.style.cssText = 'padding: 10px 12px; color: rgba(237,230,255,0.5); font-size: 12px; text-align: center;';
-    noMatches.textContent = 'No matching logins found';
-    listContainer.appendChild(noMatches);
-
-    const createBtn = document.createElement('div');
-    createBtn.style.cssText = 'padding: 10px 12px; cursor: pointer; border-radius: 8px; display: flex; align-items: center; gap: 10px; transition: background 0.15s; border-top: 1px solid rgba(255,255,255,0.04); margin-top: 4px;';
-    createBtn.onmouseenter = () => { createBtn.style.background = '#2A2340'; };
-    createBtn.onmouseleave = () => { createBtn.style.background = ''; };
-
-    const plusIcon = document.createElement('div');
-    plusIcon.style.cssText = 'width: 28px; height: 28px; border-radius: 6px; background: #2A2340; display: flex; align-items: center; justify-content: center; font-size: 16px; font-weight: 700; color: #D6A441; flex-shrink: 0;';
-    plusIcon.textContent = '+';
-    createBtn.appendChild(plusIcon);
-
-    const label = document.createElement('div');
-    label.style.cssText = 'font-size: 13px; font-weight: 500; color: #D6A441;';
-    label.textContent = 'Create new login for this site';
-    createBtn.appendChild(label);
-
-    createBtn.onclick = () => {
-        chrome.runtime.sendMessage({ type: 'OPEN_POPUP_CREATE', payload: { url: window.location.href } });
-        menu.remove();
-    };
-    listContainer.appendChild(createBtn);
-}
-
-function showInlineMenuNear(menu: HTMLElement, input: HTMLInputElement): void {
-    const rect = input.getBoundingClientRect();
-    menu.style.top = `${rect.bottom + window.scrollY + 4}px`;
-    menu.style.left = `${rect.left + window.scrollX}px`;
-    menu.style.display = 'block';
-}
-
-function fillField(input: HTMLInputElement, value: string): void {
-    const setter = Object.getOwnPropertyDescriptor(
-        window.HTMLInputElement.prototype, 'value',
-    )?.set;
-    setter?.call(input, value);
-    input.dispatchEvent(new Event('input', { bubbles: true }));
-    input.dispatchEvent(new Event('change', { bubbles: true }));
-}
-
-function fillForm(fields: FormField[], data: Record<string, string>): void {
-    for (const field of fields) {
-        if (data[field.role]) {
-            fillField(field.element, data[field.role]);
-        }
-    }
-}
-
-function initContentScript(): void {
-    let currentMenu: HTMLElement | null = null;
-    let currentInput: HTMLInputElement | null = null;
-
-    const detection = detectForms();
-    if (detection.type === 'none') return;
-
-    const passwordFields = detection.fields.filter(f => f.role === 'password' || f.role === 'email' || f.role === 'username' || f.role === 'cardNumber' || f.role === 'totp');
-
-    function loadAndShowMatches(input: HTMLInputElement): void {
-        if (currentMenu) currentMenu.remove();
-        currentInput = input;
-
-        chrome.runtime.sendMessage(
-            { type: 'GET_PAGE_MATCHES', payload: { url: window.location.href } },
-            (response) => {
-                currentMenu = createInlineMenu();
-                if (!currentMenu) return;
-
-                const listContainer = currentMenu.querySelector('#vw-inline-menu-list');
-                if (!listContainer) return;
-
-                if (!response?.success || !response.data?.length) {
-                    createNoMatchesItem(currentMenu, listContainer as HTMLElement);
-                } else {
-                    const items: any[] = response.data;
-                    const withIdentity = items.filter((i: any) => i.identityId);
-                    const withoutIdentity = items.filter((i: any) => !i.identityId);
-                    const identityIds = [...new Set(withIdentity.map((i: any) => i.identityId))];
-
-                    const renderitem = (item: any) => {
-                        const itemEl = document.createElement('div');
-                        itemEl.style.cssText = 'padding: 10px 12px; cursor: pointer; border-radius: 8px; display: flex; align-items: center; gap: 10px; transition: background 0.15s;';
-                        itemEl.onmouseenter = () => { itemEl.style.background = '#2A2340'; };
-                        itemEl.onmouseleave = () => { itemEl.style.background = ''; };
-
-                        const icon = document.createElement('div');
-                        icon.style.cssText = 'width: 28px; height: 28px; border-radius: 6px; background: #2A2340; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; color: #D6A441; flex-shrink: 0;';
-                        icon.textContent = (item.metadata.label || 'V')[0].toUpperCase();
-                        itemEl.appendChild(icon);
-
-                        const info = document.createElement('div');
-                        info.style.cssText = 'flex: 1; min-width: 0;';
-                        const label = document.createElement('div');
-                        label.style.cssText = 'font-size: 13px; font-weight: 500; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;';
-                        label.textContent = item.metadata.label;
-                        const sub = document.createElement('div');
-                        sub.style.cssText = 'font-size: 11px; color: rgba(237,230,255,0.72); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;';
-                        sub.textContent = item.data.username || item.data.email || item.data.holderName || '';
-                        info.appendChild(label);
-                        info.appendChild(sub);
-                        itemEl.appendChild(info);
-
-                        itemEl.onclick = () => {
-                            const fillData: Record<string, string> = {};
-                            if (item.itemType === 'login') {
-                                fillData.username = item.data.username || item.data.email || '';
-                                fillData.email = item.data.email || '';
-                                fillData.password = item.data.password || '';
-                                if (item.data.totpSecret) {
-                                    fillData.totp = item.data.totpSecret;
-                                }
-                            } else if (item.itemType === 'card') {
-                                fillData.cardNumber = item.data.cardNumber || '';
-                                fillData.cvv = item.data.cvv || '';
-                            }
-                            fillForm(detection.fields, fillData);
-                            chrome.runtime.sendMessage({ type: 'UPDATE_ITEM_LAST_USED', payload: { itemId: item.id } });
-                            currentMenu?.remove();
-                            currentMenu = null;
-                        };
-
-                        listContainer.appendChild(itemEl);
-                    };
-
-                    for (const identityId of identityIds) {
-                        const idItems = withIdentity.filter((i: any) => i.identityId === identityId);
-                        if (idItems.length === 0) continue;
-
-                        const header = document.createElement('div');
-                        header.style.cssText = 'padding: 6px 12px 2px; font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: rgba(214,164,65,0.7);';
-                        header.textContent = idItems[0].metadata.label?.split(' ')[0] || 'Identity';
-                        listContainer.appendChild(header);
-
-                        idItems.forEach(renderitem);
-                    }
-
-                    if (withoutIdentity.length > 0 && identityIds.length > 0) {
-                        const divider = document.createElement('div');
-                        divider.style.cssText = 'height: 1px; background: rgba(255,255,255,0.04); margin: 4px 0;';
-                        listContainer.appendChild(divider);
-                    }
-                    withoutIdentity.forEach(renderitem);
-                }
-
-                if (currentMenu && currentInput) {
-                    showInlineMenuNear(currentMenu, currentInput);
-                }
-            },
-        );
-    }
-
-    for (const field of passwordFields) {
-        field.element.addEventListener('focus', () => {
-            loadAndShowMatches(field.element);
+function send<T>(type: string, payload?: unknown): Promise<{ success: boolean; data?: T; error?: string }> {
+    return new Promise(resolve => {
+        chrome.runtime.sendMessage({ type, payload }, response => {
+            if (chrome.runtime.lastError) {
+                resolve({ success: false, error: chrome.runtime.lastError.message });
+                return;
+            }
+            resolve(response ?? { success: false, error: 'No response' });
         });
-    }
-
-    if (detection.type === 'login' && detection.score >= 60) {
-        const firstField = passwordFields[0];
-        if (firstField) {
-            setTimeout(() => {
-                if (document.activeElement === firstField.element) return;
-                loadAndShowMatches(firstField.element);
-                setTimeout(() => {
-                    if (currentMenu && !document.activeElement?.closest('#vw-inline-menu')) {
-                        currentMenu.style.display = 'none';
-                    }
-                }, 4000);
-            }, 800);
-        }
-    }
-
-    document.addEventListener('click', (e) => {
-        if (currentMenu && !currentMenu.contains(e.target as Node)) {
-            currentMenu.remove();
-            currentMenu = null;
-        }
     });
 }
 
-if (document.readyState === 'interactive' || document.readyState === 'complete') {
-    initContentScript();
-} else {
-    document.addEventListener('DOMContentLoaded', initContentScript);
+/* ------------------------------------------------------------------ state */
+
+let settings: VaultSettings | null = null;
+let forms: DetectedForm[] = [];
+const wiredFields = new WeakSet<HTMLInputElement>();
+let proactiveShown = false;
+
+/* ---------------------------------------------------------------- filling */
+
+function fillDataForItem(item: VaultItem): Partial<Record<FieldRole, string>> {
+    switch (item.itemType) {
+        case 'login': {
+            const login = item.data as LoginItem;
+            return {
+                username: login.username || '',
+                email: login.username?.includes('@') ? login.username : '',
+                password: login.password || '',
+                newPassword: login.password || '',
+                totp: login.totpSecret || '',
+            };
+        }
+        case 'card': {
+            const card = item.data as CardItem;
+            return {
+                cardNumber: card.cardNumber || '',
+                cardHolder: card.holderName || '',
+                cvv: card.cvv || '',
+                expiry: card.expiryMonth && card.expiryYear
+                    ? `${card.expiryMonth}/${card.expiryYear}`
+                    : '',
+            };
+        }
+        case 'address': {
+            const address = item.data as AddressItem;
+            return {
+                fullName: address.fullName || '',
+                street: address.street || '',
+                city: address.city || '',
+                state: address.state || '',
+                zipCode: address.zipCode || '',
+                country: address.country || '',
+                phone: address.phone || '',
+            };
+        }
+        default:
+            return {};
+    }
 }
 
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-    if (message.type === 'AUTOFILL') {
-        const detection = detectForms();
-        if (detection.type === 'none') {
-            sendResponse({ success: false, error: 'No form detected on this page' });
-            return true;
-        }
-        const fillData: Record<string, string> = message.payload || {};
-        fillForm(detection.fields, fillData);
-        sendResponse({ success: true });
+function subtitleFor(item: VaultItem): string {
+    switch (item.itemType) {
+        case 'login': return (item.data as LoginItem).username || '';
+        case 'card': return `•••• ${(item.data as CardItem).cardNumber.slice(-4)}`;
+        case 'address': return (item.data as AddressItem).city || '';
+        case 'passkey': return (item.data as PasskeyItem).userName || (item.data as PasskeyItem).rpId;
+        default: return '';
     }
+}
+
+/* ------------------------------------------------------------------- menu */
+
+async function openMenuFor(field: DetectedField): Promise<void> {
+    const form = formForElement(forms, field.element);
+    if (!form) return;
+
+    const response = await send<VaultItem[]>('GET_PAGE_MATCHES', { url: window.location.href });
+    const matches = response.data ?? [];
+
+    // Passkeys are listed for awareness only. A ceremony can only be started by
+    // the site calling navigator.credentials.get(), so a clickable entry here
+    // would promise a sign-in this menu cannot perform.
+    const passkeys = matches.filter(item => item.itemType === 'passkey');
+    const fillable = matches.filter(item => item.itemType !== 'passkey');
+
+    const grouped = [...fillable].sort((a, b) => {
+        if (!!a.identityId !== !!b.identityId) return a.identityId ? -1 : 1;
+        return (b.lastUsedAt ?? '').localeCompare(a.lastUsedAt ?? '');
+    });
+
+    showMenu({
+        anchor: field.element,
+        header: form.kind === 'signup' ? t('menuSignupHeader') : t('menuLoginsHeader'),
+        notice: passkeys.length
+            ? `${t('menuPasskeyBadge')}: ${passkeys[0].metadata.label}`
+            : undefined,
+        emptyMessage: response.success ? t('menuNoMatches') : t('menuLocked'),
+        entries: grouped.map(item => ({
+            id: item.id,
+            label: item.metadata.label,
+            sublabel: subtitleFor(item),
+            group: item.identityId ? (item.metadata.label.split(' ')[0] || t('menuIdentityFallback')) : undefined,
+            onChoose: () => {
+                fillForm(form, fillDataForItem(item));
+                void send('UPDATE_ITEM_LAST_USED', { itemId: item.id });
+            },
+        })),
+        footerLabel: t('menuCreateForSite'),
+        onFooter: () => {
+            void send('OPEN_POPUP_CREATE', { url: window.location.href });
+        },
+    });
+}
+
+/* ------------------------------------------------------------ save prompt */
+
+function readCredentials(form: DetectedForm): { username: string; password: string } | null {
+    const password = form.fields.find(f => f.role === 'password' || f.role === 'newPassword');
+    if (!password?.element.value) return null;
+
+    const identifier = form.fields.find(f => f.role === 'username' || f.role === 'email');
+    return {
+        username: identifier?.element.value ?? '',
+        password: password.element.value,
+    };
+}
+
+async function offerToSave(form: DetectedForm): Promise<void> {
+    if (!settings?.savePromptEnabled) return;
+    if (form.kind === 'payment') return;
+
+    const credentials = readCredentials(form);
+    if (!credentials) return;
+
+    const response = await send<PendingSaveDecision>('QUEUE_SAVE_PROMPT', {
+        url: window.location.href,
+        ...credentials,
+    });
+
+    const decision = response.data;
+    if (!decision || decision.status === 'locked') return;
+    if (decision.status === 'existing' && decision.samePassword) return;
+
+    showSavePrompt({
+        mode: decision.status === 'existing' ? 'update' : 'save',
+        domain: window.location.hostname,
+        username: credentials.username,
+        onConfirm: () => {
+            void send('SAVE_LOGIN_FROM_PAGE', {
+                url: window.location.href,
+                ...credentials,
+                itemId: decision.itemId,
+            });
+            void send('CLEAR_PENDING_SAVE');
+        },
+        onDismiss: () => { void send('CLEAR_PENDING_SAVE'); },
+    });
+}
+
+/**
+ * A submit that navigates kills this script before the prompt can be answered,
+ * so the background holds the pending save and the next page load picks it up.
+ */
+async function showPendingSaveFromPreviousPage(): Promise<void> {
+    if (!settings?.savePromptEnabled) return;
+
+    const response = await send<{
+        url: string;
+        username: string;
+        password: string;
+        decision: PendingSaveDecision;
+    } | null>('GET_PENDING_SAVE');
+
+    const pending = response.data;
+    if (!pending) return;
+
+    showSavePrompt({
+        mode: pending.decision.status === 'existing' ? 'update' : 'save',
+        domain: new URL(pending.url).hostname,
+        username: pending.username,
+        onConfirm: () => {
+            void send('SAVE_LOGIN_FROM_PAGE', {
+                url: pending.url,
+                username: pending.username,
+                password: pending.password,
+                itemId: pending.decision.itemId,
+            });
+            void send('CLEAR_PENDING_SAVE');
+        },
+        onDismiss: () => { void send('CLEAR_PENDING_SAVE'); },
+    });
+}
+
+/* ----------------------------------------------------------------- wiring */
+
+function wireForm(form: DetectedForm): void {
+    for (const field of form.fields) {
+        if (wiredFields.has(field.element)) continue;
+        if (!TRIGGER_ROLES.has(field.role)) continue;
+        wiredFields.add(field.element);
+
+        field.element.addEventListener('focus', () => {
+            if (!settings?.autoFillEnabled) return;
+            void openMenuFor(field);
+        });
+    }
+
+    if (form.scope instanceof HTMLFormElement && !form.scope.dataset.vwSubmitWired) {
+        form.scope.dataset.vwSubmitWired = '1';
+        form.scope.addEventListener('submit', () => { void offerToSave(form); }, true);
+    }
+}
+
+/**
+ * Sites that never fire a real `submit` (most SPA login pages post via fetch)
+ * still have a button the user presses. Capturing at the document level catches
+ * both without needing per-site rules.
+ */
+function wireGlobalSubmitFallback(): void {
+    document.addEventListener('click', event => {
+        const target = event.target as HTMLElement | null;
+        const button = target?.closest('button, input[type=submit], [role=button]');
+        if (!button) return;
+
+        const form = forms.find(f => f.scope.contains(button) || f.scope === button);
+        if (!form) return;
+        // Let the page's own handler run first, then read the fields.
+        setTimeout(() => { void offerToSave(form); }, 150);
+    }, true);
+
+    document.addEventListener('keydown', event => {
+        if (event.key !== 'Enter') return;
+        const active = document.activeElement;
+        if (!(active instanceof HTMLInputElement)) return;
+        const form = formForElement(forms, active);
+        if (!form) return;
+        setTimeout(() => { void offerToSave(form); }, 150);
+    }, true);
+}
+
+/* ------------------------------------------------------------------ scan */
+
+function rescan(): void {
+    if (!settings?.autoDetectEnabled) return;
+
+    forms = detectForms();
+    for (const form of forms) wireForm(form);
+
+    // Close a menu whose field has been removed or hidden by a re-render.
+    if (isMenuOpen()) {
+        const active = document.activeElement;
+        if (!(active instanceof HTMLInputElement) || !isVisible(active)) closeMenu();
+    }
+}
+
+function scheduleRescan(): void {
+    if (scheduleRescan.handle) clearTimeout(scheduleRescan.handle);
+    scheduleRescan.handle = setTimeout(rescan, RESCAN_DEBOUNCE_MS);
+}
+scheduleRescan.handle = undefined as ReturnType<typeof setTimeout> | undefined;
+
+function observeDom(): void {
+    // Debounced because SPA pages mutate constantly; a scan per mutation would
+    // blow the 16.7ms frame budget on any busy page.
+    const observer = new MutationObserver(mutations => {
+        for (const mutation of mutations) {
+            if (mutation.type !== 'childList') continue;
+            if (mutation.addedNodes.length === 0) continue;
+            scheduleRescan();
+            return;
+        }
+    });
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+}
+
+/* ------------------------------------------------------------------- init */
+
+async function init(): Promise<void> {
+    const response = await send<VaultSettings>('GET_SETTINGS');
+    settings = response.data ?? null;
+    if (!settings) return;
+
+    rescan();
+    observeDom();
+    wireGlobalSubmitFallback();
+    void showPendingSaveFromPreviousPage();
+
+    // A login page the user landed on directly: offer matches without making
+    // them click into the field first.
+    if (settings.autoFillEnabled) {
+        setTimeout(() => {
+            if (proactiveShown || isMenuOpen()) return;
+            const loginForm = forms.find(f => f.kind === 'login' && f.score >= 65);
+            const field = loginForm?.fields.find(f => TRIGGER_ROLES.has(f.role));
+            if (!field || !isVisible(field.element)) return;
+            proactiveShown = true;
+            void openMenuFor(field);
+        }, PROACTIVE_DELAY_MS);
+    }
+}
+
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => void init());
+} else {
+    void init();
+}
+
+/* ------------------------------------------------- popup-triggered autofill */
+
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message.type !== 'AUTOFILL') return false;
+
+    if (forms.length === 0) rescan();
+    const target = forms.find(f => f.kind !== 'payment') ?? forms[0];
+    if (!target) {
+        sendResponse({ success: false, error: 'No form detected on this page' });
+        return true;
+    }
+
+    const filled = fillForm(target, message.payload ?? {});
+    sendResponse({ success: filled > 0, error: filled > 0 ? undefined : 'No matching fields on this page' });
     return true;
 });

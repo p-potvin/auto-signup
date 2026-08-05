@@ -1,13 +1,20 @@
 /* eslint-disable @typescript-eslint/no-require-imports */
 const path = require('path');
+const webpack = require('webpack');
 const HtmlWebpackPlugin = require('html-webpack-plugin');
 const CopyWebpackPlugin = require('copy-webpack-plugin');
 const MiniCssExtractPlugin = require('mini-css-extract-plugin');
+const { version } = require('./package.json');
 
 module.exports = {
     entry: {
         background: './src/background/index.ts',
         content: './src/content/index.ts',
+        // Runs in the page's world to replace navigator.credentials; must stay
+        // a separate bundle from `content` because the two live in different
+        // JavaScript worlds.
+        'webauthn-inject': './src/webauthn/inject.ts',
+        'webauthn-bridge': './src/webauthn/bridge.ts',
         popup: './src/popup/index.tsx',
         vault: './src/vault/index.tsx',
         onboarding: './src/onboarding/index.tsx',
@@ -34,6 +41,9 @@ module.exports = {
         ],
     },
     plugins: [
+        new webpack.DefinePlugin({
+            __VW_VERSION__: JSON.stringify(version),
+        }),
         new MiniCssExtractPlugin({ filename: '[name].css' }),
         new HtmlWebpackPlugin({
             template: './src/popup/index.html',

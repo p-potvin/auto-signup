@@ -2,7 +2,31 @@
 
 > A **VaultWares** project.
 
-Identity vault and auto-signup Chrome extension. Detects sign-up forms and fills them with generated identities and strong passwords.
+Identity vault, passkey authenticator, and auto-signup extension for Firefox 128+
+and Chrome. Detects login and sign-up forms, suggests vault entries, and acts as
+a full WebAuthn authenticator so passkeys live in the encrypted vault instead of
+a single device.
+
+## Capabilities
+
+- **Passkeys.** Replaces `navigator.credentials` to create and assert real
+  WebAuthn credentials (ES256), with the private keys sealed in the vault. Every
+  ceremony needs explicit consent, and the browser or a security key is always
+  one click away. Design and open gaps: `docs/passkeys.md`.
+- **Identities.** Personas are created and edited by hand; AI generation is an
+  optional convenience over the same editor and is never required.
+- **Autofill.** Detects credential forms across shadow roots and late-rendered
+  SPA views, scopes fills to one form, and offers to save what you submit.
+
+## Verification
+
+```bash
+npm run typecheck && npm run test:webauthn && npm run build
+```
+
+`test:webauthn` runs a relying party against the authenticator — it parses the
+attestation with an independent CBOR decoder and verifies 300 assertion
+signatures with WebCrypto.
 
 ## Program Documentation
 

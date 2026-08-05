@@ -8,7 +8,9 @@ import { createVaultItem as apiCreateItem, updateVaultItem as apiUpdateItem, del
 import { pushChanges, pullChanges } from '../api/sync';
 import { enqueueCreate, enqueueUpdate, enqueueDelete, processQueue, fullSync, startAutoSync } from '../api/sync-queue';
 import { generateIdentity as generateIdentityApi } from '../api/generation';
-import type { VaultItem, EncryptedVaultItem, ItemType, VaultItemData, VaultItemMetadata, VaultSettings, RecoveryKit, Identity, GeneratedIdentityData } from '../types';
+import { prepareCeremony, performCreate, performGet, WebAuthnError, type PasskeyRecord, type VaultAccess } from '../webauthn/service';
+import type { SerializedCreationOptions, SerializedRequestOptions } from '../webauthn/types';
+import type { VaultItem, EncryptedVaultItem, ItemType, VaultItemData, VaultItemMetadata, VaultSettings, RecoveryKit, Identity, GeneratedIdentityData, PasskeyItem, LoginItem } from '../types';
 
 export type MessageType =
     | 'INIT_CHECK'
@@ -34,7 +36,15 @@ export type MessageType =
     | 'GENERATE_IDENTITY'
     | 'ASSIGN_ITEM_TO_IDENTITY'
     | 'UNASSIGN_ITEM_FROM_IDENTITY'
-    | 'UPDATE_ITEM_LAST_USED';
+    | 'UPDATE_ITEM_LAST_USED'
+    | 'WEBAUTHN_PREPARE'
+    | 'WEBAUTHN_CREATE'
+    | 'WEBAUTHN_GET'
+    | 'OPEN_VAULT_UNLOCK'
+    | 'QUEUE_SAVE_PROMPT'
+    | 'GET_PENDING_SAVE'
+    | 'CLEAR_PENDING_SAVE'
+    | 'SAVE_LOGIN_FROM_PAGE';
 
 export interface Message {
     type: MessageType;
@@ -45,6 +55,8 @@ export interface MessageResponse {
     success: boolean;
     data?: any;
     error?: string;
+    /** Set for WebAuthn failures so the page can throw the right DOMException. */
+    errorName?: string;
 }
 
 let lockTimer: ReturnType<typeof setTimeout> | null = null;
@@ -499,7 +511,263 @@ async function handleUpdateItemLastUsed(payload: { itemId: string }): Promise<Me
     }
 }
 
-chrome.runtime.onMessage.addListener((message: Message, _sender, sendResponse) => {
+/* ------------------------------------------------------------- passkeys */
+
+/**
+ * Vault surface handed to the passkey service. Reuses the same envelope path as
+ * every other item, so passkeys are encrypted, synced, and locked identically.
+ */
+const passkeyVaultAccess: VaultAccess = {
+    isUnlocked: async () => (await getCachedMasterKey()) !== null,
+
+    listPasskeys: async (): Promise<PasskeyRecord[]> => {
+        const kemSecretKey = await getKemSecretKey();
+        const sigKp = await getSigKeyPair();
+        if (!kemSecretKey || !sigKp) return [];
+
+        const records: PasskeyRecord[] = [];
+        for (const enc of await getEncryptedItems()) {
+            if (enc.deletedAt || enc.envelope.itemType !== 'passkey') continue;
+            try {
+                const item = openEnvelope(enc, kemSecretKey, sigKp.publicKey);
+                records.push({ itemId: item.id, passkey: item.data as PasskeyItem });
+            } catch (e) {
+                console.error('Failed to decrypt passkey:', enc.id, e);
+            }
+        }
+        return records;
+    },
+
+    createItem: async (itemType, data, metadata) => {
+        const response = await handleCreateItem({ itemType, data, metadata });
+        if (!response.success) throw new Error(response.error ?? 'Could not store the passkey');
+        return response.data as VaultItem;
+    },
+
+    touchItem: async (itemId: string) => {
+        await handleUpdateItemLastUsed({ itemId });
+    },
+};
+
+function webAuthnFailure(e: unknown): MessageResponse {
+    if (e instanceof WebAuthnError) {
+        return { success: false, error: e.message, errorName: e.errorName };
+    }
+    return { success: false, error: (e as Error).message, errorName: 'NotAllowedError' };
+}
+
+async function handleWebAuthnPrepare(payload: {
+    kind: 'create' | 'get';
+    origin: string;
+    options: SerializedCreationOptions | SerializedRequestOptions;
+}): Promise<MessageResponse> {
+    try {
+        const settings = await getSettings();
+        const result = await prepareCeremony(
+            payload.kind,
+            payload.origin,
+            payload.options,
+            passkeyVaultAccess,
+            settings.passkeysEnabled,
+        );
+        return { success: true, data: result };
+    } catch (e) {
+        return webAuthnFailure(e);
+    }
+}
+
+async function handleWebAuthnCreate(payload: {
+    origin: string;
+    options: SerializedCreationOptions;
+}): Promise<MessageResponse> {
+    try {
+        const settings = await getSettings();
+        if (!settings.passkeysEnabled) {
+            return { success: false, error: 'Passkeys are disabled in VaultWares settings', errorName: 'NotAllowedError' };
+        }
+        const result = await performCreate(payload.origin, payload.options, passkeyVaultAccess);
+        return { success: true, data: result };
+    } catch (e) {
+        return webAuthnFailure(e);
+    }
+}
+
+async function handleWebAuthnGet(payload: {
+    origin: string;
+    options: SerializedRequestOptions;
+    credentialId?: string;
+}): Promise<MessageResponse> {
+    try {
+        const settings = await getSettings();
+        if (!settings.passkeysEnabled) {
+            return { success: false, error: 'Passkeys are disabled in VaultWares settings', errorName: 'NotAllowedError' };
+        }
+        const result = await performGet(
+            payload.origin,
+            payload.options,
+            passkeyVaultAccess,
+            payload.credentialId,
+        );
+        return { success: true, data: result };
+    } catch (e) {
+        return webAuthnFailure(e);
+    }
+}
+
+/* ---------------------------------------------------------- save prompt */
+
+interface PendingSave {
+    url: string;
+    username: string;
+    password: string;
+    decision: { status: 'new' | 'existing'; itemId?: string; samePassword?: boolean };
+    expiresAt: number;
+}
+
+/**
+ * Submitted credentials awaiting a save decision, keyed by tab.
+ *
+ * Held in worker memory only and never written to storage: a submit that
+ * navigates destroys the content script before the user can answer, so the
+ * prompt has to survive one page load — but no longer, and not on disk.
+ */
+const pendingSaves = new Map<number, PendingSave>();
+const PENDING_SAVE_TTL_MS = 2 * 60 * 1000;
+
+function prunePendingSaves(): void {
+    const now = Date.now();
+    for (const [tabId, pending] of pendingSaves) {
+        if (pending.expiresAt < now) pendingSaves.delete(tabId);
+    }
+}
+
+chrome.tabs.onRemoved.addListener(tabId => pendingSaves.delete(tabId));
+
+/**
+ * Reports whether a submitted credential is new, already stored, or a changed
+ * password for a known account — so the content script can ask the right
+ * question instead of offering to save a duplicate.
+ */
+async function handleFindLoginForSave(payload: {
+    url: string;
+    username: string;
+    password: string;
+}): Promise<MessageResponse> {
+    try {
+        if (!await passkeyVaultAccess.isUnlocked()) {
+            return { success: true, data: { status: 'locked' } };
+        }
+
+        const kemSecretKey = await getKemSecretKey();
+        const sigKp = await getSigKeyPair();
+        if (!kemSecretKey || !sigKp) return { success: true, data: { status: 'locked' } };
+
+        const { normalizeDomain } = await import('../utils/domain');
+        const domain = normalizeDomain(payload.url);
+        const username = payload.username.trim().toLowerCase();
+
+        for (const enc of await getEncryptedItems()) {
+            if (enc.deletedAt || enc.envelope.itemType !== 'login') continue;
+            if ((enc.envelope.metadata.domain || '') !== domain) continue;
+
+            const item = openEnvelope(enc, kemSecretKey, sigKp.publicKey);
+            const login = item.data as LoginItem;
+            if ((login.username ?? '').trim().toLowerCase() !== username) continue;
+
+            return {
+                success: true,
+                data: {
+                    status: 'existing',
+                    itemId: item.id,
+                    // Identical credentials mean there is nothing to ask about.
+                    samePassword: login.password === payload.password,
+                },
+            };
+        }
+
+        return { success: true, data: { status: 'new' } };
+    } catch (e) {
+        return { success: false, error: (e as Error).message };
+    }
+}
+
+async function handleQueueSavePrompt(
+    payload: { url: string; username: string; password: string },
+    tabId: number | undefined,
+): Promise<MessageResponse> {
+    const response = await handleFindLoginForSave(payload);
+    if (!response.success) return response;
+
+    const decision = response.data as PendingSave['decision'] | { status: 'locked' };
+    prunePendingSaves();
+
+    const actionable = decision.status === 'new'
+        || (decision.status === 'existing' && !(decision as PendingSave['decision']).samePassword);
+
+    if (tabId !== undefined && actionable) {
+        pendingSaves.set(tabId, {
+            ...payload,
+            decision: decision as PendingSave['decision'],
+            expiresAt: Date.now() + PENDING_SAVE_TTL_MS,
+        });
+    }
+
+    return { success: true, data: decision };
+}
+
+function handleGetPendingSave(tabId: number | undefined): MessageResponse {
+    prunePendingSaves();
+    if (tabId === undefined) return { success: true, data: null };
+    return { success: true, data: pendingSaves.get(tabId) ?? null };
+}
+
+async function handleSaveLoginFromPage(payload: {
+    url: string;
+    username: string;
+    password: string;
+    itemId?: string;
+}): Promise<MessageResponse> {
+    try {
+        const { normalizeDomain, getFullDomain } = await import('../utils/domain');
+        const domain = normalizeDomain(payload.url);
+
+        if (payload.itemId) {
+            const kemSecretKey = await getKemSecretKey();
+            const sigKp = await getSigKeyPair();
+            if (!kemSecretKey || !sigKp) return { success: false, error: 'Keychain not initialized' };
+
+            const enc = (await getEncryptedItems()).find(i => i.id === payload.itemId);
+            if (!enc) return { success: false, error: 'Item not found' };
+
+            const item = openEnvelope(enc, kemSecretKey, sigKp.publicKey);
+            const login = item.data as LoginItem;
+            return handleUpdateItem({
+                id: item.id,
+                data: { ...login, password: payload.password },
+                metadata: item.metadata,
+            });
+        }
+
+        return handleCreateItem({
+            itemType: 'login',
+            data: {
+                url: payload.url,
+                username: payload.username,
+                password: payload.password,
+            } satisfies LoginItem,
+            metadata: {
+                label: getFullDomain(payload.url) || domain,
+                domain,
+                tags: [],
+                favorite: false,
+            },
+        });
+    } catch (e) {
+        return { success: false, error: (e as Error).message };
+    }
+}
+
+chrome.runtime.onMessage.addListener((message: Message, sender, sendResponse) => {
     (async () => {
         let response: MessageResponse;
 
@@ -576,6 +844,32 @@ chrome.runtime.onMessage.addListener((message: Message, _sender, sendResponse) =
                 break;
             case 'UPDATE_ITEM_LAST_USED':
                 response = await handleUpdateItemLastUsed(message.payload);
+                break;
+            case 'WEBAUTHN_PREPARE':
+                response = await handleWebAuthnPrepare(message.payload);
+                break;
+            case 'WEBAUTHN_CREATE':
+                response = await handleWebAuthnCreate(message.payload);
+                break;
+            case 'WEBAUTHN_GET':
+                response = await handleWebAuthnGet(message.payload);
+                break;
+            case 'OPEN_VAULT_UNLOCK':
+                chrome.tabs.create({ url: chrome.runtime.getURL('vault.html?action=unlock') });
+                response = { success: true };
+                break;
+            case 'QUEUE_SAVE_PROMPT':
+                response = await handleQueueSavePrompt(message.payload, sender.tab?.id);
+                break;
+            case 'GET_PENDING_SAVE':
+                response = handleGetPendingSave(sender.tab?.id);
+                break;
+            case 'CLEAR_PENDING_SAVE':
+                if (sender.tab?.id !== undefined) pendingSaves.delete(sender.tab.id);
+                response = { success: true };
+                break;
+            case 'SAVE_LOGIN_FROM_PAGE':
+                response = await handleSaveLoginFromPage(message.payload);
                 break;
             default:
                 response = { success: false, error: 'Unknown message type' };
