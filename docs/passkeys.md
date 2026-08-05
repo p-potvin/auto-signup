@@ -72,6 +72,15 @@ restyle it, or find it with `querySelector` to fake a click. Verified: with the
 prompt open, `document.getElementById('vw-passkey-consent').shadowRoot` is
 `null` and its `textContent` is empty.
 
+**The prompt is anchored to the side, and on sign-in the account row is the
+button.** A centred modal covers the part of the page the user is reading —
+often the sign-in form the ceremony belongs to — so it sits top-right (centred
+below 520px, where there is no room at the side). The backdrop stays, because
+that is what makes the prompt modal and blocks click-jacking. On a sign-in,
+picking the passkey and confirming are the same decision, so the account rows
+are styled as the primary control and there is no separate confirm button;
+registration keeps one, since there is nothing to pick.
+
 **rpId is checked against the origin** (`isRpIdAllowed`). Without it any page
 could ask us to mint or assert a credential for another site — the exact attack
 WebAuthn's origin binding exists to stop. `notexample.com` cannot claim

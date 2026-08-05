@@ -8,7 +8,9 @@ import { generateTotpCode, getTotpRemainingSeconds } from '../utils/totp';
 import { normalizeDomain, getFaviconUrl } from '../utils/domain';
 import type { VaultItem, LoginItem, TotpItem, VaultItemMetadata, Identity } from '../types';
 
-function send<T>(msg: { type: string; payload?: any }): Promise<{ success: boolean; data?: T; error?: string }> {
+import { useAutoUnlock } from '../utils/use-auto-unlock';
+
+function send<T>(msg: { type: string; payload?: any }): Promise<{ success: boolean; data?: T; error?: string; locked?: boolean }> {
     return chrome.runtime.sendMessage(msg);
 }
 
@@ -18,6 +20,7 @@ export default function App() {
     const [pin, setPin] = useState('');
     const [error, setError] = useState('');
     const [loading, setLoading] = useState(false);
+    const [dataLoading, setDataLoading] = useState(false);
     const [password, setPassword] = useState('');
     const [copied, setCopied] = useState(false);
     const [matches, setMatches] = useState<VaultItem[]>([]);
@@ -40,16 +43,19 @@ export default function App() {
         if (!tab?.url) return;
         setCurrentTab(tab);
         const resp = await send<VaultItem[]>({ type: 'GET_PAGE_MATCHES', payload: { url: tab.url } });
+        if (resp.locked) { setUnlocked(false); return; }
         if (resp.success && resp.data) setMatches(resp.data);
     }, []);
 
     const loadIdentities = useCallback(async () => {
         const resp = await send<Identity[]>({ type: 'GET_IDENTITIES' });
+        if (resp.locked) { setUnlocked(false); return; }
         if (resp.success && resp.data) setIdentities(resp.data);
     }, []);
 
     const loadItemCount = useCallback(async () => {
         const resp = await send<VaultItem[]>({ type: 'GET_ITEMS' });
+        if (resp.locked) { setUnlocked(false); return; }
         if (resp.success && resp.data) setItemCount(resp.data.length);
     }, []);
 
@@ -60,11 +66,12 @@ export default function App() {
     }, [checkInit, checkUnlocked]);
 
     useEffect(() => {
-        if (unlocked) {
-            loadMatches();
-            loadItemCount();
-            loadIdentities();
-        }
+        if (!unlocked) return;
+        // Decryption takes a moment; without this the popup shows "no matches"
+        // before the real answer arrives.
+        setDataLoading(true);
+        void Promise.all([loadMatches(), loadItemCount(), loadIdentities()])
+            .finally(() => setDataLoading(false));
     }, [unlocked, loadMatches, loadItemCount, loadIdentities]);
 
     const [showQuickGen, setShowQuickGen] = useState(false);
@@ -83,14 +90,25 @@ export default function App() {
         setTimeout(() => setCopied(false), 1200);
     };
 
+    const handleUnlocked = useCallback(() => {
+        setUnlocked(true);
+        setPin('');
+        setError('');
+    }, []);
+
+    // Unlocks as soon as the PIN is right, with no Enter press.
+    const { checking: autoChecking } = useAutoUnlock({
+        enabled: initialized === true && !unlocked,
+        pin,
+        onUnlocked: handleUnlocked,
+    });
+
     const handleUnlock = async () => {
         setLoading(true);
         const resp = await send({ type: 'UNLOCK', payload: { pin } });
         setLoading(false);
         if (resp.success) {
-            setUnlocked(true);
-            setPin('');
-            setError('');
+            handleUnlocked();
         } else {
             setError(resp.error ?? 'Unlock failed');
         }
@@ -194,15 +212,20 @@ export default function App() {
                             <p className="text-[11px] text-vw-console-text-secondary">Enter PIN to decrypt locally</p>
                         </div>
                     </div>
-                    <input
-                        type="password"
-                        value={pin}
-                        onChange={(e) => setPin(e.target.value)}
-                        onKeyDown={(e) => e.key === 'Enter' && handleUnlock()}
-                        placeholder="••••"
-                        className="w-full px-4 py-2.5 bg-vw-console-surface border border-vw-console-border rounded-lg text-white font-mono text-base focus:outline-none focus:border-vw-gold mb-2"
-                        autoFocus
-                    />
+                    <div className="relative mb-2">
+                        <input
+                            type="password"
+                            value={pin}
+                            onChange={(e) => { setPin(e.target.value); setError(''); }}
+                            onKeyDown={(e) => e.key === 'Enter' && handleUnlock()}
+                            placeholder="••••"
+                            className="w-full px-4 py-2.5 pr-10 bg-vw-console-surface border border-vw-console-border rounded-lg text-white font-mono text-base focus:outline-none focus:border-vw-gold"
+                            autoFocus
+                        />
+                        {autoChecking && (
+                            <Loader2 className="w-4 h-4 text-vw-gold animate-spin absolute right-3.5 top-1/2 -translate-y-1/2" />
+                        )}
+                    </div>
                     {error && <p className="text-xs text-vw-signal-alert mb-2">{error}</p>}
                     <button
                         onClick={handleUnlock}

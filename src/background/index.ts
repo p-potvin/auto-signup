@@ -41,6 +41,9 @@ export type MessageType =
     | 'WEBAUTHN_CREATE'
     | 'WEBAUTHN_GET'
     | 'OPEN_VAULT_UNLOCK'
+    | 'GET_SYNC_STATUS'
+    | 'GET_PAGE_IDENTITIES'
+    | 'TOUCH_IDENTITY'
     | 'QUEUE_SAVE_PROMPT'
     | 'GET_PENDING_SAVE'
     | 'CLEAR_PENDING_SAVE'
@@ -57,6 +60,14 @@ export interface MessageResponse {
     error?: string;
     /** Set for WebAuthn failures so the page can throw the right DOMException. */
     errorName?: string;
+    /**
+     * The vault was locked, so `data` is empty because nothing could be
+     * decrypted — not because there is nothing stored.
+     *
+     * Without this the UI cannot tell those two apart and renders its empty
+     * state, which looks exactly like the vault has been wiped.
+     */
+    locked?: boolean;
 }
 
 let lockTimer: ReturnType<typeof setTimeout> | null = null;
@@ -145,7 +156,7 @@ async function handleGetItems(): Promise<MessageResponse> {
 
         const masterKey = await getCachedMasterKey();
         if (!masterKey) {
-            return { success: false, error: 'Vault is locked' };
+            return { success: false, error: 'Vault is locked', locked: true };
         }
 
         const items: VaultItem[] = [];
@@ -262,14 +273,55 @@ async function handleDownloadRecoveryKit(payload: { kit: RecoveryKit }): Promise
     }
 }
 
+export interface SyncStatus {
+    state: 'idle' | 'syncing' | 'ok' | 'error';
+    lastAttemptAt: string | null;
+    lastSuccessAt: string | null;
+    pushed: number;
+    pulled: number;
+    error: string | null;
+}
+
+/**
+ * Sync ran silently every 60s with no way to tell whether it worked. Tracked
+ * here so the UI can say so — a vault that claims to sync and gives no feedback
+ * is indistinguishable from one that is quietly failing.
+ */
+let syncStatus: SyncStatus = {
+    state: 'idle',
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    pushed: 0,
+    pulled: 0,
+    error: null,
+};
+
 async function handleSync(): Promise<MessageResponse> {
+    syncStatus = { ...syncStatus, state: 'syncing', error: null, lastAttemptAt: new Date().toISOString() };
     try {
         const queueResult = await processQueue();
         const syncResult = await fullSync();
-        return { success: true, data: { ...syncResult, ...queueResult } };
+
+        syncStatus = {
+            ...syncStatus,
+            // fullSync swallows transport errors and reports ok:false rather
+            // than throwing, so a green tick here would be a lie without it.
+            state: syncResult.ok ? 'ok' : 'error',
+            lastSuccessAt: syncResult.ok ? new Date().toISOString() : syncStatus.lastSuccessAt,
+            pushed: syncResult.pushed,
+            pulled: syncResult.pulled,
+            error: syncResult.ok ? null : 'Could not reach the local vault-warden',
+        };
+
+        return { success: true, data: { ...syncResult, ...queueResult, status: syncStatus } };
     } catch (e) {
+        syncStatus = { ...syncStatus, state: 'error', error: (e as Error).message };
         return { success: false, error: (e as Error).message };
     }
+}
+
+function handleGetSyncStatus(): MessageResponse {
+    return { success: true, data: syncStatus };
 }
 
 async function handleGetPageMatches(payload: { url: string }): Promise<MessageResponse> {
@@ -278,10 +330,10 @@ async function handleGetPageMatches(payload: { url: string }): Promise<MessageRe
         const kemSecretKey = await getKemSecretKey();
         const sigKp = await getSigKeyPair();
 
-        if (!kemSecretKey || !sigKp) return { success: true, data: [] };
+        if (!kemSecretKey || !sigKp) return { success: true, data: [], locked: true };
 
         const masterKey = await getCachedMasterKey();
-        if (!masterKey) return { success: true, data: [] };
+        if (!masterKey) return { success: true, data: [], locked: true };
 
         const { normalizeDomain, domainMatches, urlMatches } = await import('../utils/domain');
         const pageDomain = normalizeDomain(payload.url);
@@ -326,6 +378,66 @@ async function handleGetPageMatches(payload: { url: string }): Promise<MessageRe
     }
 }
 
+/**
+ * Identities offered for autofill on a page, most relevant first.
+ *
+ * Identities are not domain-scoped the way logins are — a persona is meant to
+ * be reusable across sites. But one that already owns an item on this domain is
+ * the one you almost certainly want, so it sorts to the top; the rest follow by
+ * recency. Without this the content script never sees identities at all and a
+ * saved persona can never fill an address form.
+ */
+async function handleGetPageIdentities(payload: { url: string }): Promise<MessageResponse> {
+    try {
+        const identitiesResponse = await handleGetIdentities();
+        if (identitiesResponse.locked || !identitiesResponse.success) return identitiesResponse;
+
+        const identities = (identitiesResponse.data ?? []) as Identity[];
+        if (identities.length === 0) return { success: true, data: [] };
+
+        const matchesResponse = await handleGetPageMatches(payload);
+        const domainItems = (matchesResponse.data ?? []) as VaultItem[];
+        const domainIdentityIds = new Set(
+            domainItems.map(item => item.identityId).filter((id): id is string => !!id),
+        );
+
+        const ranked = [...identities].sort((a, b) => {
+            const aLinked = domainIdentityIds.has(a.id);
+            const bLinked = domainIdentityIds.has(b.id);
+            if (aLinked !== bLinked) return aLinked ? -1 : 1;
+            if (a.metadata.favorite !== b.metadata.favorite) return a.metadata.favorite ? -1 : 1;
+            return (b.lastUsedAt ?? '').localeCompare(a.lastUsedAt ?? '');
+        });
+
+        return {
+            success: true,
+            data: ranked.map(identity => ({
+                identity,
+                linkedToDomain: domainIdentityIds.has(identity.id),
+            })),
+        };
+    } catch (e) {
+        return { success: false, error: (e as Error).message };
+    }
+}
+
+/** Records that an identity was used, so it ranks higher next time. */
+async function handleTouchIdentity(payload: { id: string }): Promise<MessageResponse> {
+    try {
+        const response = await handleGetIdentities();
+        if (!response.success) return response;
+
+        const identity = (response.data as Identity[]).find(i => i.id === payload.id);
+        if (!identity) return { success: false, error: 'Identity not found' };
+
+        return handleUpdateIdentity({
+            identity: { ...identity, lastUsedAt: new Date().toISOString() },
+        });
+    } catch (e) {
+        return { success: false, error: (e as Error).message };
+    }
+}
+
 function createIdentityObject(data: GeneratedIdentityData, deviceId: string): Identity {
     const now = new Date().toISOString();
     return {
@@ -353,10 +465,10 @@ async function handleGetIdentities(): Promise<MessageResponse> {
         const encIdentities = await getEncryptedIdentities();
         const kemSecretKey = await getKemSecretKey();
         const sigKp = await getSigKeyPair();
-        if (!kemSecretKey || !sigKp) return { success: true, data: [] };
+        if (!kemSecretKey || !sigKp) return { success: true, data: [], locked: true };
 
         const masterKey = await getCachedMasterKey();
-        if (!masterKey) return { success: true, data: [] };
+        if (!masterKey) return { success: true, data: [], locked: true };
 
         const identities: Identity[] = [];
         for (const enc of encIdentities) {
@@ -627,21 +739,36 @@ interface PendingSave {
 /**
  * Submitted credentials awaiting a save decision, keyed by tab.
  *
- * Held in worker memory only and never written to storage: a submit that
- * navigates destroys the content script before the user can answer, so the
- * prompt has to survive one page load — but no longer, and not on disk.
+ * Kept in `chrome.storage.session`, not a module-level Map. A submit that
+ * navigates tears down the content script before the user can answer, so the
+ * pending save must survive one page load — and an MV3 service worker is
+ * evicted when idle, which would take a Map with it exactly during that gap.
+ * Session storage is memory-backed and cleared when the browser closes, so the
+ * plaintext password still never reaches disk.
  */
-const pendingSaves = new Map<number, PendingSave>();
+const PENDING_SAVE_KEY = 'vw_pending_saves';
 const PENDING_SAVE_TTL_MS = 2 * 60 * 1000;
 
-function prunePendingSaves(): void {
+async function readPendingSaves(): Promise<Record<string, PendingSave>> {
+    const stored = await chrome.storage.session.get(PENDING_SAVE_KEY) as Record<string, any>;
+    const all = (stored[PENDING_SAVE_KEY] as Record<string, PendingSave>) ?? {};
+
     const now = Date.now();
-    for (const [tabId, pending] of pendingSaves) {
-        if (pending.expiresAt < now) pendingSaves.delete(tabId);
+    const live: Record<string, PendingSave> = {};
+    for (const [tabId, pending] of Object.entries(all)) {
+        if (pending.expiresAt > now) live[tabId] = pending;
     }
+    return live;
 }
 
-chrome.tabs.onRemoved.addListener(tabId => pendingSaves.delete(tabId));
+async function writePendingSave(tabId: number, pending: PendingSave | null): Promise<void> {
+    const all = await readPendingSaves();
+    if (pending) all[String(tabId)] = pending;
+    else delete all[String(tabId)];
+    await chrome.storage.session.set({ [PENDING_SAVE_KEY]: all });
+}
+
+chrome.tabs.onRemoved.addListener(tabId => { void writePendingSave(tabId, null); });
 
 /**
  * Reports whether a submitted credential is new, already stored, or a changed
@@ -699,13 +826,12 @@ async function handleQueueSavePrompt(
     if (!response.success) return response;
 
     const decision = response.data as PendingSave['decision'] | { status: 'locked' };
-    prunePendingSaves();
 
     const actionable = decision.status === 'new'
         || (decision.status === 'existing' && !(decision as PendingSave['decision']).samePassword);
 
     if (tabId !== undefined && actionable) {
-        pendingSaves.set(tabId, {
+        await writePendingSave(tabId, {
             ...payload,
             decision: decision as PendingSave['decision'],
             expiresAt: Date.now() + PENDING_SAVE_TTL_MS,
@@ -715,10 +841,10 @@ async function handleQueueSavePrompt(
     return { success: true, data: decision };
 }
 
-function handleGetPendingSave(tabId: number | undefined): MessageResponse {
-    prunePendingSaves();
+async function handleGetPendingSave(tabId: number | undefined): Promise<MessageResponse> {
     if (tabId === undefined) return { success: true, data: null };
-    return { success: true, data: pendingSaves.get(tabId) ?? null };
+    const all = await readPendingSaves();
+    return { success: true, data: all[String(tabId)] ?? null };
 }
 
 async function handleSaveLoginFromPage(payload: {
@@ -858,14 +984,23 @@ chrome.runtime.onMessage.addListener((message: Message, sender, sendResponse) =>
                 chrome.tabs.create({ url: chrome.runtime.getURL('vault.html?action=unlock') });
                 response = { success: true };
                 break;
+            case 'GET_SYNC_STATUS':
+                response = handleGetSyncStatus();
+                break;
+            case 'GET_PAGE_IDENTITIES':
+                response = await handleGetPageIdentities(message.payload);
+                break;
+            case 'TOUCH_IDENTITY':
+                response = await handleTouchIdentity(message.payload);
+                break;
             case 'QUEUE_SAVE_PROMPT':
                 response = await handleQueueSavePrompt(message.payload, sender.tab?.id);
                 break;
             case 'GET_PENDING_SAVE':
-                response = handleGetPendingSave(sender.tab?.id);
+                response = await handleGetPendingSave(sender.tab?.id);
                 break;
             case 'CLEAR_PENDING_SAVE':
-                if (sender.tab?.id !== undefined) pendingSaves.delete(sender.tab.id);
+                if (sender.tab?.id !== undefined) await writePendingSave(sender.tab.id, null);
                 response = { success: true };
                 break;
             case 'SAVE_LOGIN_FROM_PAGE':

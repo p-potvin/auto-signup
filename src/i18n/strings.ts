@@ -105,6 +105,14 @@ const STRINGS = {
         en: 'Identity',
         qc: 'Identité',
     },
+    menuIdentitiesGroup: {
+        en: 'Identities',
+        qc: 'Identités',
+    },
+    menuLinkedBadge: {
+        en: 'This site',
+        qc: 'Ce site',
+    },
 
     /* --------------------------------------------------- save-login prompt */
     savePromptTitle: {

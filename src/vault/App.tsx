@@ -5,11 +5,13 @@ import {
     Download, Monitor, ChevronRight, Star, AlertCircle, Users, User, Sparkles
 } from 'lucide-react';
 import type { VaultItem, ItemType, VaultSettings, LoginItem, AddressItem, CardItem, TotpItem, PasskeyItem, Identity, GeneratedIdentityData } from '../types';
+import type { SyncStatus } from '../background';
 import { DEFAULT_SETTINGS } from '../types';
 import { generatePassword, generatePassphrase, generateToken, generateFromPreset, measurePasswordStrength, strengthLabel, strengthColor, PRESETS, type GeneratorPreset, type PasswordOptions, type PassphraseOptions } from '../utils/password-generator';
 import { generateTotpCode, getTotpRemainingSeconds } from '../utils/totp';
 import { normalizeDomain, getFaviconUrl, getInitials } from '../utils/domain';
 import { t } from '../i18n/strings';
+import { useAutoUnlock } from '../utils/use-auto-unlock';
 
 /** A blank persona for the manual create path — no generation service involved. */
 function emptyIdentityData(): GeneratedIdentityData {
@@ -47,7 +49,7 @@ interface IdentityEditorState {
     identity: Identity | null;
 }
 
-function send<T>(msg: { type: string; payload?: any }): Promise<{ success: boolean; data?: T; error?: string }> {
+function send<T>(msg: { type: string; payload?: any }): Promise<{ success: boolean; data?: T; error?: string; locked?: boolean }> {
     return chrome.runtime.sendMessage(msg);
 }
 
@@ -76,6 +78,9 @@ export default function App() {
     const [prefillUrl, setPrefillUrl] = useState('');
     const [settings, setSettings] = useState<VaultSettings | null>(null);
     const [loading, setLoading] = useState(false);
+    const [dataLoading, setDataLoading] = useState(false);
+    const [syncing, setSyncing] = useState(false);
+    const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
     const [selectedIdentity, setSelectedIdentity] = useState<Identity | null>(null);
     const [generatingIdentity, setGeneratingIdentity] = useState(false);
     const [identityEditor, setIdentityEditor] = useState<IdentityEditorState | null>(null);
@@ -91,13 +96,21 @@ export default function App() {
         setUnlocked(resp.data?.unlocked ?? false);
     }, []);
 
+    /**
+     * A locked vault decrypts nothing, so it answers with an empty list. Taking
+     * that at face value paints the "no identities yet" empty state over a vault
+     * that is merely locked, which reads as data loss. Bounce to the unlock
+     * screen instead and leave the cached lists alone.
+     */
     const loadItems = useCallback(async () => {
         const resp = await send<VaultItem[]>({ type: 'GET_ITEMS' });
+        if (resp.locked) { setUnlocked(false); return; }
         if (resp.success && resp.data) setItems(resp.data);
     }, []);
 
     const loadIdentities = useCallback(async () => {
         const resp = await send<Identity[]>({ type: 'GET_IDENTITIES' });
+        if (resp.locked) { setUnlocked(false); return; }
         if (resp.success && resp.data) setIdentities(resp.data);
     }, []);
 
@@ -112,30 +125,47 @@ export default function App() {
     }, [checkInit, checkUnlocked]);
 
     useEffect(() => {
-        if (unlocked) {
-            loadItems();
-            loadIdentities();
-            loadSettings();
-            const params = new URLSearchParams(window.location.search);
-            if (params.get('action') === 'create') {
-                const url = params.get('url') || '';
-                if (url) {
-                    setCreatingType('login');
-                    setPrefillUrl(url);
-                }
+        if (!unlocked) return;
+
+        // Decryption is not instant. Without this flag the lists render as []
+        // first and the empty state flashes before the real data lands.
+        setDataLoading(true);
+        void Promise.all([loadItems(), loadIdentities(), loadSettings()])
+            .finally(() => setDataLoading(false));
+        void loadSyncStatus();
+
+        const params = new URLSearchParams(window.location.search);
+        if (params.get('action') === 'create') {
+            const url = params.get('url') || '';
+            if (url) {
+                setCreatingType('login');
+                setPrefillUrl(url);
             }
         }
     }, [unlocked, loadItems, loadIdentities, loadSettings]);
+
+    const handleUnlocked = useCallback(() => {
+        setUnlocked(true);
+        setPin('');
+        setError('');
+    }, []);
+
+    // Unlocks the moment the PIN is right, so no Enter press is needed.
+    const { checking: autoChecking } = useAutoUnlock({
+        enabled: initialized === true && !unlocked,
+        pin,
+        onUnlocked: handleUnlocked,
+    });
 
     const handleUnlock = async () => {
         setLoading(true);
         const resp = await send({ type: 'UNLOCK', payload: { pin } });
         setLoading(false);
         if (resp.success) {
-            setUnlocked(true);
-            setPin('');
-            setError('');
+            handleUnlocked();
         } else {
+            // Only an explicit submit reports failure; the background attempts
+            // stay silent so a half-typed PIN does not read as an error.
             setError(resp.error ?? 'Unlock failed');
         }
     };
@@ -144,12 +174,20 @@ export default function App() {
         await send({ type: 'LOCK' });
         setUnlocked(false);
         setItems([]);
+        setIdentities([]);
     };
 
+    const loadSyncStatus = useCallback(async () => {
+        const resp = await send<SyncStatus>({ type: 'GET_SYNC_STATUS' });
+        if (resp.success && resp.data) setSyncStatus(resp.data);
+    }, []);
+
     const handleSync = async () => {
-        setLoading(true);
-        await send({ type: 'SYNC' });
-        setLoading(false);
+        setSyncing(true);
+        const resp = await send<{ status: SyncStatus }>({ type: 'SYNC' });
+        setSyncing(false);
+        if (resp.data?.status) setSyncStatus(resp.data.status);
+        else await loadSyncStatus();
         await loadItems();
         await loadIdentities();
     };
@@ -277,15 +315,20 @@ export default function App() {
                             <p className="text-xs text-vw-console-text-secondary">Enter your PIN to decrypt locally</p>
                         </div>
                     </div>
-                    <input
-                        type="password"
-                        value={pin}
-                        onChange={(e) => setPin(e.target.value)}
-                        onKeyDown={(e) => e.key === 'Enter' && handleUnlock()}
-                        placeholder="••••"
-                        className="w-full px-4 py-3 bg-vw-console-surface border border-vw-console-border rounded-lg text-white font-mono text-lg focus:outline-none focus:border-vw-gold mb-3"
-                        autoFocus
-                    />
+                    <div className="relative mb-3">
+                        <input
+                            type="password"
+                            value={pin}
+                            onChange={(e) => { setPin(e.target.value); setError(''); }}
+                            onKeyDown={(e) => e.key === 'Enter' && handleUnlock()}
+                            placeholder="••••"
+                            className="w-full px-4 py-3 pr-11 bg-vw-console-surface border border-vw-console-border rounded-lg text-white font-mono text-lg focus:outline-none focus:border-vw-gold"
+                            autoFocus
+                        />
+                        {autoChecking && (
+                            <Loader2 className="w-4 h-4 text-vw-gold animate-spin absolute right-4 top-1/2 -translate-y-1/2" />
+                        )}
+                    </div>
                     {error && <p className="text-sm text-vw-signal-alert mb-3">{error}</p>}
                     <button
                         onClick={handleUnlock}
@@ -361,11 +404,19 @@ export default function App() {
                 <div className="px-3 py-3 border-t border-[#161320]/8">
                     <button
                         onClick={handleSync}
-                        className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-[#161320]/70 hover:bg-[#161320]/5 transition-colors"
+                        disabled={syncing}
+                        className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-[#161320]/70 hover:bg-[#161320]/5 transition-colors disabled:opacity-60"
                     >
-                        <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
-                        Sync
+                        <RefreshCw className={`w-4 h-4 ${syncing ? 'animate-spin' : ''}`} />
+                        <span className="flex-1 text-left">Sync</span>
+                        {!syncing && syncStatus?.state === 'ok' && (
+                            <Check className="w-3.5 h-3.5 text-vw-signal-online" />
+                        )}
+                        {!syncing && syncStatus?.state === 'error' && (
+                            <AlertCircle className="w-3.5 h-3.5 text-vw-signal-alert" />
+                        )}
                     </button>
+                    <SyncStatusLine status={syncStatus} syncing={syncing} />
                     <button
                         onClick={handleLock}
                         className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-[#161320]/70 hover:bg-[#161320]/5 transition-colors"
@@ -426,7 +477,12 @@ export default function App() {
                                 </div>
                             )}
 
-                            {identities.length === 0 && !generatingIdentity ? (
+                            {dataLoading ? (
+                                <div className="text-center py-20">
+                                    <Loader2 className="w-8 h-8 text-vw-gold animate-spin mx-auto mb-3" />
+                                    <p className="text-sm text-vw-console-text-secondary">Decrypting vault…</p>
+                                </div>
+                            ) : identities.length === 0 && !generatingIdentity ? (
                                 <div className="text-center py-20">
                                     <Users className="w-12 h-12 text-vw-console-text-secondary/30 mx-auto mb-3" />
                                     <p className="text-vw-console-text-secondary mb-4">No identities yet. Create one by hand, or generate one if you have an endpoint configured.</p>
@@ -528,7 +584,12 @@ export default function App() {
                                 </div>
                             </div>
 
-                            {filteredItems.length === 0 ? (
+                            {dataLoading ? (
+                                <div className="text-center py-20">
+                                    <Loader2 className="w-8 h-8 text-vw-gold animate-spin mx-auto mb-3" />
+                                    <p className="text-sm text-vw-console-text-secondary">Decrypting vault…</p>
+                                </div>
+                            ) : filteredItems.length === 0 ? (
                                 <div className="text-center py-20">
                                     <Shield className="w-12 h-12 text-vw-console-text-secondary/30 mx-auto mb-3" />
                                     <p className="text-vw-console-text-secondary">No items yet. Create your first vault item.</p>
@@ -1160,6 +1221,41 @@ function DevicesPanel() {
                     ))}
                 </div>
             )}
+        </div>
+    );
+}
+
+function relativeTime(iso: string): string {
+    const seconds = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
+    if (seconds < 60) return 'just now';
+    const minutes = Math.round(seconds / 60);
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.round(minutes / 60);
+    if (hours < 24) return `${hours}h ago`;
+    return `${Math.round(hours / 24)}d ago`;
+}
+
+function SyncStatusLine({ status, syncing }: { status: SyncStatus | null; syncing: boolean }) {
+    let text: string;
+    let tone = 'text-[#161320]/45';
+
+    if (syncing) {
+        text = 'Syncing…';
+    } else if (status?.state === 'error') {
+        text = status.error ?? 'Sync failed';
+        tone = 'text-vw-signal-alert';
+    } else if (status?.lastSuccessAt) {
+        text = `Synced ${relativeTime(status.lastSuccessAt)}`;
+    } else {
+        text = 'Not synced yet';
+    }
+
+    return (
+        <div className="px-3 pb-1">
+            <p className={`text-[10px] ${tone}`}>{text}</p>
+            {/* Sync only covers vault items today — identities live on this
+                device alone. Saying so beats letting the user assume otherwise. */}
+            <p className="text-[10px] text-[#161320]/35">Items only — identities stay local</p>
         </div>
     );
 }

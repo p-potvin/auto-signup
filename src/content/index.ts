@@ -19,7 +19,12 @@ import {
 import { showMenu, closeMenu, isMenuOpen } from './menu';
 import { showSavePrompt } from './save-prompt';
 import { t } from '../i18n/strings';
-import type { VaultItem, LoginItem, CardItem, AddressItem, PasskeyItem, VaultSettings } from '../types';
+import type { VaultItem, LoginItem, CardItem, AddressItem, PasskeyItem, VaultSettings, Identity } from '../types';
+
+interface PageIdentity {
+    identity: Identity;
+    linkedToDomain: boolean;
+}
 
 const RESCAN_DEBOUNCE_MS = 300;
 const PROACTIVE_DELAY_MS = 700;
@@ -35,7 +40,7 @@ interface PendingSaveDecision {
     samePassword?: boolean;
 }
 
-function send<T>(type: string, payload?: unknown): Promise<{ success: boolean; data?: T; error?: string }> {
+function send<T>(type: string, payload?: unknown): Promise<{ success: boolean; data?: T; error?: string; locked?: boolean }> {
     return new Promise(resolve => {
         chrome.runtime.sendMessage({ type, payload }, response => {
             if (chrome.runtime.lastError) {
@@ -96,6 +101,31 @@ function fillDataForItem(item: VaultItem): Partial<Record<FieldRole, string>> {
     }
 }
 
+/**
+ * A persona fills the who-are-you fields: name, contact, address. It carries no
+ * password, so a login form still needs a login item — but the email is offered
+ * as the identifier, which is what a persona is normally signed up with.
+ */
+function fillDataForIdentity(identity: Identity): Partial<Record<FieldRole, string>> {
+    const [firstName = '', ...rest] = identity.fullName.trim().split(/\s+/);
+    const address = identity.address ?? ({} as AddressItem);
+
+    return {
+        fullName: identity.fullName,
+        firstName,
+        lastName: rest.join(' '),
+        email: identity.email || '',
+        username: identity.email || '',
+        phone: identity.phone || address.phone || '',
+        birthDate: identity.birthDate || '',
+        street: address.street || '',
+        city: address.city || '',
+        state: address.state || '',
+        zipCode: address.zipCode || '',
+        country: address.country || '',
+    };
+}
+
 function subtitleFor(item: VaultItem): string {
     switch (item.itemType) {
         case 'login': return (item.data as LoginItem).username || '';
@@ -108,12 +138,26 @@ function subtitleFor(item: VaultItem): string {
 
 /* ------------------------------------------------------------------- menu */
 
+/** Roles a persona can fill; used to decide whether to offer identities. */
+const IDENTITY_ROLES: ReadonlySet<FieldRole> = new Set<FieldRole>([
+    'fullName', 'firstName', 'lastName', 'phone', 'birthDate',
+    'street', 'city', 'state', 'zipCode', 'country',
+]);
+
 async function openMenuFor(field: DetectedField): Promise<void> {
     const form = formForElement(forms, field.element);
     if (!form) return;
 
-    const response = await send<VaultItem[]>('GET_PAGE_MATCHES', { url: window.location.href });
+    const [response, identityResponse] = await Promise.all([
+        send<VaultItem[]>('GET_PAGE_MATCHES', { url: window.location.href }),
+        send<PageIdentity[]>('GET_PAGE_IDENTITIES', { url: window.location.href }),
+    ]);
     const matches = response.data ?? [];
+
+    // Offer personas where the form actually has fields for one — a sign-up or
+    // checkout form — rather than on a bare username/password pair.
+    const formWantsIdentity = form.fields.some(f => IDENTITY_ROLES.has(f.role));
+    const identities = formWantsIdentity ? (identityResponse.data ?? []) : [];
 
     // Passkeys are listed for awareness only. A ceremony can only be started by
     // the site calling navigator.credentials.get(), so a clickable entry here
@@ -126,23 +170,43 @@ async function openMenuFor(field: DetectedField): Promise<void> {
         return (b.lastUsedAt ?? '').localeCompare(a.lastUsedAt ?? '');
     });
 
+    const identityEntries = identities.map(({ identity, linkedToDomain }) => ({
+        id: `identity:${identity.id}`,
+        label: identity.fullName || identity.email,
+        sublabel: [identity.email, identity.address?.city].filter(Boolean).join(' · '),
+        badge: linkedToDomain ? t('menuLinkedBadge') : undefined,
+        group: t('menuIdentitiesGroup'),
+        onChoose: () => {
+            fillForm(form, fillDataForIdentity(identity));
+            void send('TOUCH_IDENTITY', { id: identity.id });
+        },
+    }));
+
+    const itemEntries = grouped.map(item => ({
+        id: item.id,
+        label: item.metadata.label,
+        sublabel: subtitleFor(item),
+        group: item.identityId ? (item.metadata.label.split(' ')[0] || t('menuIdentityFallback')) : undefined,
+        onChoose: () => {
+            fillForm(form, fillDataForItem(item));
+            void send('UPDATE_ITEM_LAST_USED', { itemId: item.id });
+        },
+    }));
+
+    const locked = response.locked || identityResponse.locked;
+
     showMenu({
         anchor: field.element,
         header: form.kind === 'signup' ? t('menuSignupHeader') : t('menuLoginsHeader'),
         notice: passkeys.length
             ? `${t('menuPasskeyBadge')}: ${passkeys[0].metadata.label}`
             : undefined,
-        emptyMessage: response.success ? t('menuNoMatches') : t('menuLocked'),
-        entries: grouped.map(item => ({
-            id: item.id,
-            label: item.metadata.label,
-            sublabel: subtitleFor(item),
-            group: item.identityId ? (item.metadata.label.split(' ')[0] || t('menuIdentityFallback')) : undefined,
-            onChoose: () => {
-                fillForm(form, fillDataForItem(item));
-                void send('UPDATE_ITEM_LAST_USED', { itemId: item.id });
-            },
-        })),
+        emptyMessage: locked ? t('menuLocked') : t('menuNoMatches'),
+        // Personas first on a sign-up form: filling the persona is the step that
+        // comes before choosing a login there.
+        entries: form.kind === 'signup'
+            ? [...identityEntries, ...itemEntries]
+            : [...itemEntries, ...identityEntries],
         footerLabel: t('menuCreateForSite'),
         onFooter: () => {
             void send('OPEN_POPUP_CREATE', { url: window.location.href });
@@ -163,13 +227,38 @@ function readCredentials(form: DetectedForm): { username: string; password: stri
     };
 }
 
-async function offerToSave(form: DetectedForm): Promise<void> {
+/**
+ * Credentials already handed to the background this page-load, so a submit that
+ * fires both a `submit` event and a button click does not queue twice.
+ */
+let lastQueued = '';
+
+/**
+ * Reads the fields and posts to the background *synchronously*.
+ *
+ * The read cannot be deferred. A submit that navigates starts tearing down this
+ * document immediately; anything waiting on a timer or an await never sees the
+ * field values. So the values are pulled out and the message dispatched in the
+ * same task as the event, and only the prompt — which needs the background's
+ * answer — is asynchronous. If the page survives, the prompt shows here; if it
+ * navigates, the background is already holding the pending save for the next
+ * load.
+ */
+function offerToSave(form: DetectedForm): void {
     if (!settings?.savePromptEnabled) return;
     if (form.kind === 'payment') return;
 
     const credentials = readCredentials(form);
     if (!credentials) return;
 
+    const fingerprint = `${credentials.username} ${credentials.password}`;
+    if (fingerprint === lastQueued) return;
+    lastQueued = fingerprint;
+
+    void queueAndPrompt(credentials);
+}
+
+async function queueAndPrompt(credentials: { username: string; password: string }): Promise<void> {
     const response = await send<PendingSaveDecision>('QUEUE_SAVE_PROMPT', {
         url: window.location.href,
         ...credentials,
@@ -245,7 +334,7 @@ function wireForm(form: DetectedForm): void {
 
     if (form.scope instanceof HTMLFormElement && !form.scope.dataset.vwSubmitWired) {
         form.scope.dataset.vwSubmitWired = '1';
-        form.scope.addEventListener('submit', () => { void offerToSave(form); }, true);
+        form.scope.addEventListener('submit', () => offerToSave(form), true);
     }
 }
 
@@ -261,9 +350,7 @@ function wireGlobalSubmitFallback(): void {
         if (!button) return;
 
         const form = forms.find(f => f.scope.contains(button) || f.scope === button);
-        if (!form) return;
-        // Let the page's own handler run first, then read the fields.
-        setTimeout(() => { void offerToSave(form); }, 150);
+        if (form) offerToSave(form);
     }, true);
 
     document.addEventListener('keydown', event => {
@@ -271,9 +358,23 @@ function wireGlobalSubmitFallback(): void {
         const active = document.activeElement;
         if (!(active instanceof HTMLInputElement)) return;
         const form = formForElement(forms, active);
-        if (!form) return;
-        setTimeout(() => { void offerToSave(form); }, 150);
+        if (form) offerToSave(form);
     }, true);
+
+    /*
+     * Last line of defence. Some flows never produce a submit or a recognisable
+     * button press — a script calls location.assign, or the user hits a custom
+     * control we did not classify. `pagehide` is the final point at which the
+     * field values still exist, so a filled password that was never queued gets
+     * queued here.
+     */
+    window.addEventListener('pagehide', () => {
+        if (!settings?.savePromptEnabled) return;
+        for (const form of forms) {
+            if (form.kind === 'payment') continue;
+            offerToSave(form);
+        }
+    }, { capture: true });
 }
 
 /* ------------------------------------------------------------------ scan */

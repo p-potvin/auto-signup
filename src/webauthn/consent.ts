@@ -42,25 +42,34 @@ const HOST_ID = 'vw-passkey-consent';
 function styleSheet(): string {
     return `
         ${BASE_FONT_STYLE}
+        /*
+         * Anchored top-right rather than centred. A centred modal covers the
+         * part of the page the user is trying to read — often the very sign-in
+         * form the ceremony belongs to. The backdrop stays (it is what makes
+         * the prompt modal and blocks click-jacking) but is kept light.
+         */
         .backdrop {
             position: fixed;
             inset: 0;
-            background: rgba(6, 4, 12, 0.62);
-            backdrop-filter: blur(2px);
+            background: rgba(6, 4, 12, 0.38);
             display: flex;
             align-items: flex-start;
-            justify-content: center;
-            padding: 48px 16px 16px;
+            justify-content: flex-end;
+            padding: 16px;
         }
         .card {
             width: 100%;
-            max-width: 420px;
+            max-width: 380px;
             background: ${TOKENS.consoleSurface};
             border: 1px solid ${TOKENS.consoleBorderSubtle};
             border-radius: ${TOKENS.radiusLg};
             box-shadow: ${TOKENS.shadowOverlay};
             padding: 20px;
             color: ${TOKENS.consoleTextStrong};
+        }
+        /* Narrow viewports have no room at the side; centre horizontally. */
+        @media (max-width: 520px) {
+            .backdrop { justify-content: center; }
         }
         .brand {
             display: flex;
@@ -106,33 +115,63 @@ function styleSheet(): string {
             text-transform: uppercase;
             color: ${TOKENS.consoleTextMuted};
         }
+        /*
+         * On a sign-in the account row IS the action — picking the passkey and
+         * confirming are the same decision — so it is styled as the primary
+         * control rather than sitting above a separate confirm button.
+         */
         .account {
             display: flex;
             align-items: center;
-            gap: 10px;
+            gap: 12px;
             width: 100%;
             text-align: left;
-            padding: 9px 10px;
-            border-radius: ${TOKENS.radiusSm};
-            border: 1px solid ${TOKENS.consoleBorderSubtle};
+            padding: 12px;
+            border-radius: ${TOKENS.radiusMd};
+            border: 1px solid ${TOKENS.gold}66;
             background: ${TOKENS.consoleRaised};
+            transition: background 0.12s, border-color 0.12s;
         }
-        .account:hover, .account[aria-selected="true"] { background: ${TOKENS.consoleElevated}; }
+        .account:hover, .account[aria-selected="true"] {
+            background: ${TOKENS.consoleElevated};
+            border-color: ${TOKENS.gold};
+        }
         .account .avatar {
-            width: 26px; height: 26px; flex-shrink: 0;
-            border-radius: 6px;
+            width: 34px; height: 34px; flex-shrink: 0;
+            border-radius: 8px;
             background: ${TOKENS.consoleActive};
             display: flex; align-items: center; justify-content: center;
-            font-size: 12px; font-weight: 700; color: ${TOKENS.gold};
+            font-size: 14px; font-weight: 700; color: ${TOKENS.gold};
         }
-        .account .who { min-width: 0; }
+        .account .who {
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            /* Display name and username were colliding; give them room. */
+            gap: 3px;
+        }
         .account .name {
-            font-size: 13px; font-weight: 500;
+            font-size: 14px; font-weight: 600; line-height: 1.2;
             white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
         }
         .account .sub {
-            font-size: 11px; color: ${TOKENS.consoleTextSecondary};
+            font-size: 12px; line-height: 1.2; color: ${TOKENS.consoleTextSecondary};
             white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        }
+        .account .go {
+            margin-left: auto;
+            flex-shrink: 0;
+            color: ${TOKENS.gold};
+            font-size: 16px;
+        }
+        /* Read-only account display shown during registration. */
+        .account.static {
+            border-color: ${TOKENS.consoleBorderSubtle};
+            cursor: default;
+        }
+        .account.static:hover {
+            background: ${TOKENS.consoleRaised};
+            border-color: ${TOKENS.consoleBorderSubtle};
         }
         .empty {
             font-size: 12px;
@@ -333,12 +372,22 @@ export function requestConsent(request: ConsentRequest): Promise<ConsentDecision
                         const name = document.createElement('span');
                         name.className = 'name';
                         name.textContent = account.userDisplayName || account.userName;
-                        const sub = document.createElement('span');
-                        sub.className = 'sub';
-                        sub.textContent = account.userName;
-                        who.append(name, sub);
+                        who.appendChild(name);
 
-                        button.append(avatar, who);
+                        // Only show the username separately when it says
+                        // something the display name does not.
+                        if (account.userName && account.userName !== account.userDisplayName) {
+                            const sub = document.createElement('span');
+                            sub.className = 'sub';
+                            sub.textContent = account.userName;
+                            who.appendChild(sub);
+                        }
+
+                        const go = document.createElement('span');
+                        go.className = 'go';
+                        go.textContent = '→';
+
+                        button.append(avatar, who, go);
                         button.addEventListener('click', () => {
                             selectedCredentialId = account.credentialId;
                             settle({ action: 'approve', credentialId: account.credentialId });
@@ -348,25 +397,35 @@ export function requestConsent(request: ConsentRequest): Promise<ConsentDecision
                     card.appendChild(wrap);
                 }
             } else if (request.summary.userName) {
+                // Registration: this is the account the site says the passkey is
+                // for. It is information, not a choice, so it does not get the
+                // clickable treatment.
                 const wrap = document.createElement('div');
                 wrap.className = 'accounts';
                 const label = document.createElement('div');
                 label.className = 'account-label';
                 label.textContent = t('passkeyAccountLabel');
+
                 const value = document.createElement('div');
-                value.className = 'account';
+                value.className = 'account static';
                 const avatar = document.createElement('span');
                 avatar.className = 'avatar';
                 avatar.textContent = initials(request.summary.userDisplayName || request.summary.userName);
+
                 const who = document.createElement('span');
                 who.className = 'who';
                 const name = document.createElement('span');
                 name.className = 'name';
                 name.textContent = request.summary.userDisplayName || request.summary.userName;
-                const sub = document.createElement('span');
-                sub.className = 'sub';
-                sub.textContent = request.summary.userName;
-                who.append(name, sub);
+                who.appendChild(name);
+
+                if (request.summary.userName !== request.summary.userDisplayName) {
+                    const sub = document.createElement('span');
+                    sub.className = 'sub';
+                    sub.textContent = request.summary.userName;
+                    who.appendChild(sub);
+                }
+
                 value.append(avatar, who);
                 wrap.append(label, value);
                 card.appendChild(wrap);
@@ -375,14 +434,23 @@ export function requestConsent(request: ConsentRequest): Promise<ConsentDecision
             const actions = document.createElement('div');
             actions.className = 'actions';
 
-            const approve = document.createElement('button');
-            approve.className = 'primary';
-            approve.textContent = request.kind === 'create'
-                ? t('passkeyApproveCreate')
-                : t('passkeyApproveGet');
-            approve.disabled = request.kind === 'get' && !hasAccounts;
-            approve.addEventListener('click', () =>
-                settle({ action: 'approve', credentialId: selectedCredentialId }));
+            // On a sign-in with accounts listed, the rows already are the
+            // confirm step. A separate "Sign in" button would just repeat the
+            // choice the user has already been asked to make.
+            const needsConfirmButton = request.kind === 'create' || !hasAccounts;
+            let approve: HTMLButtonElement | null = null;
+
+            if (needsConfirmButton) {
+                approve = document.createElement('button');
+                approve.className = 'primary';
+                approve.textContent = request.kind === 'create'
+                    ? t('passkeyApproveCreate')
+                    : t('passkeyApproveGet');
+                approve.disabled = request.kind === 'get' && !hasAccounts;
+                approve.addEventListener('click', () =>
+                    settle({ action: 'approve', credentialId: selectedCredentialId }));
+                actions.appendChild(approve);
+            }
 
             const fallback = document.createElement('button');
             fallback.className = 'secondary';
@@ -394,10 +462,11 @@ export function requestConsent(request: ConsentRequest): Promise<ConsentDecision
             cancel.textContent = t('passkeyCancel');
             cancel.addEventListener('click', () => settle({ action: 'cancel' }));
 
-            actions.append(approve, fallback, cancel);
+            actions.append(fallback, cancel);
             card.appendChild(actions);
 
-            (approve.disabled ? fallback : approve).focus();
+            const firstAccount = card.querySelector<HTMLElement>('.account');
+            (approve && !approve.disabled ? approve : firstAccount ?? fallback).focus();
         };
 
         render(request.locked, false);
