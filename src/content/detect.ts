@@ -59,20 +59,29 @@ const FILLABLE_SELECTOR =
 /**
  * Collects inputs across open shadow roots. Closed roots are unreachable by
  * design and are simply not supported.
+ *
+ * Inputs come from a single native selector query per tree rather than from
+ * filtering every element by hand. Shadow hosts have no selector, so the tree
+ * does still have to be walked to find them — but a TreeWalker iterates lazily
+ * instead of materialising a NodeList of every element on the page, which on a
+ * large document is the expensive part.
  */
 export function collectInputs(root: ParentNode = document): HTMLInputElement[] {
     const found: HTMLInputElement[] = [];
     const seen = new Set<Element>();
 
     const walk = (node: ParentNode) => {
-        for (const element of Array.from(node.querySelectorAll<HTMLElement>('*'))) {
-            if (element instanceof HTMLInputElement) {
-                if (!seen.has(element) && element.matches(FILLABLE_SELECTOR)) {
-                    seen.add(element);
-                    found.push(element);
-                }
-            }
-            if (element.shadowRoot) walk(element.shadowRoot);
+        for (const input of Array.from(node.querySelectorAll<HTMLInputElement>(FILLABLE_SELECTOR))) {
+            if (seen.has(input)) continue;
+            seen.add(input);
+            found.push(input);
+        }
+
+        const doc = (node as Node).ownerDocument ?? document;
+        const walker = doc.createTreeWalker(node as Node, NodeFilter.SHOW_ELEMENT);
+        for (let node2 = walker.nextNode(); node2; node2 = walker.nextNode()) {
+            const shadow = (node2 as Element).shadowRoot;
+            if (shadow) walk(shadow);
         }
     };
 
@@ -211,27 +220,53 @@ export function detectFieldRole(input: HTMLInputElement): DetectedField {
 
 /* -------------------------------------------------------------- grouping */
 
+/** How far up from an input we will look for a container to treat as its form. */
+const MAX_SCOPE_DEPTH = 8;
+
 /**
- * The container to treat as "the form". A real `<form>` wins; otherwise walk up
- * until a container holds more than one fillable input, which is what a
- * div-based login box looks like.
+ * Assigns each input the container to treat as "the form". A real `<form>`
+ * wins; otherwise the nearest ancestor holding more than one input, which is
+ * what a div-based login box looks like.
+ *
+ * Resolved for the whole set at once. Asking the DOM "how many inputs are under
+ * this element" per input per ancestor level re-scans the subtree over and over
+ * — O(inputs x depth x subtree size), which stalls the frame on a large page.
+ * Counting ancestors in a single pass gives the same answer in
+ * O(inputs x depth), independent of document size.
  */
-function scopeFor(input: HTMLInputElement): Element {
-    const form = input.form;
-    if (form) return form;
-
-    let node: Element | null = input.parentElement;
-    let fallback: Element = input.parentElement ?? input;
-    let depth = 0;
-
-    while (node && depth < 8) {
-        const count = node.querySelectorAll(FILLABLE_SELECTOR).length;
-        if (count > 1) return node;
-        fallback = node;
-        node = node.parentElement;
-        depth++;
+function buildScopes(inputs: HTMLInputElement[]): Map<HTMLInputElement, Element> {
+    const inputsUnder = new Map<Element, number>();
+    for (const input of inputs) {
+        let node = input.parentElement;
+        for (let depth = 0; node && depth < MAX_SCOPE_DEPTH; depth++) {
+            inputsUnder.set(node, (inputsUnder.get(node) ?? 0) + 1);
+            node = node.parentElement;
+        }
     }
-    return fallback;
+
+    const scopes = new Map<HTMLInputElement, Element>();
+    for (const input of inputs) {
+        if (input.form) {
+            scopes.set(input, input.form);
+            continue;
+        }
+
+        let node = input.parentElement;
+        let fallback: Element = input.parentElement ?? input;
+        let chosen: Element | null = null;
+
+        for (let depth = 0; node && depth < MAX_SCOPE_DEPTH; depth++) {
+            if ((inputsUnder.get(node) ?? 0) > 1) {
+                chosen = node;
+                break;
+            }
+            fallback = node;
+            node = node.parentElement;
+        }
+
+        scopes.set(input, chosen ?? fallback);
+    }
+    return scopes;
 }
 
 function classify(fields: DetectedField[]): { kind: FormKind; score: number } {
@@ -275,9 +310,11 @@ export function detectForms(root: ParentNode = document): DetectedForm[] {
     const inputs = collectInputs(root).filter(isVisible);
     if (inputs.length === 0) return [];
 
+    const scopes = buildScopes(inputs);
     const groups = new Map<Element, DetectedField[]>();
     for (const input of inputs) {
-        const scope = scopeFor(input);
+        const scope = scopes.get(input);
+        if (!scope) continue;
         const field = detectFieldRole(input);
         const existing = groups.get(scope);
         if (existing) existing.push(field);
@@ -320,14 +357,33 @@ export function formForElement(forms: DetectedForm[], element: Element): Detecte
  * render. Going through the native setter and firing the events is what makes
  * the fill stick.
  */
+/**
+ * Finds the native `value` setter for this specific element.
+ *
+ * Not `window.HTMLInputElement.prototype`: an input inside a same-origin iframe
+ * belongs to that frame's realm and its prototype is a different object. Not
+ * `Object.getPrototypeOf(input)` either — for a custom element extending
+ * `HTMLInputElement` that is the subclass prototype, which carries no `value`
+ * descriptor of its own, so the lookup would come back undefined and the fill
+ * would silently do nothing. Walking the chain handles both.
+ */
+function nativeValueSetter(input: HTMLInputElement): ((value: string) => void) | undefined {
+    let proto: object | null = Object.getPrototypeOf(input);
+    while (proto) {
+        const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+        if (descriptor?.set) return descriptor.set;
+        proto = Object.getPrototypeOf(proto);
+    }
+    return undefined;
+}
+
 export function fillField(input: HTMLInputElement, value: string): void {
-    const setter = Object.getOwnPropertyDescriptor(
-        window.HTMLInputElement.prototype,
-        'value',
-    )?.set;
+    const setter = nativeValueSetter(input);
 
     input.focus();
-    setter?.call(input, value);
+    if (setter) setter.call(input, value);
+    else input.value = value;
+
     input.dispatchEvent(new Event('input', { bubbles: true }));
     input.dispatchEvent(new Event('change', { bubbles: true }));
 }

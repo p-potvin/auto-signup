@@ -1311,14 +1311,18 @@ function IdentityEditorModal({ mode, data, onSave, onCancel }: {
             return;
         }
         setValidationError('');
+        // A record written by an older version — or returned by a generation
+        // endpoint that omitted the block — may have no address at all, so it
+        // is defaulted rather than destructured blind.
+        const address = local.address ?? emptyIdentityData().address;
         // The address carries its own name field; keep it in step with the
         // persona so autofill does not put two different names on one form.
         onSave({
             ...local,
             address: {
-                ...local.address,
-                fullName: local.address.fullName.trim() || local.fullName,
-                phone: local.address.phone || local.phone,
+                ...address,
+                fullName: (address.fullName ?? '').trim() || local.fullName,
+                phone: address.phone || local.phone,
             },
         });
     };

@@ -404,7 +404,10 @@ function observeDom(): void {
     const observer = new MutationObserver(mutations => {
         for (const mutation of mutations) {
             if (mutation.type !== 'childList') continue;
-            if (mutation.addedNodes.length === 0) continue;
+            // Removals matter too: a view swap tears the old form out, and
+            // without a rescan `forms` keeps pointing at detached elements and
+            // an open menu stays anchored to a field that no longer exists.
+            if (mutation.addedNodes.length === 0 && mutation.removedNodes.length === 0) continue;
             scheduleRescan();
             return;
         }

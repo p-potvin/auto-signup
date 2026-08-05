@@ -101,27 +101,61 @@ function buildCredential(
     return credential as unknown as PublicKeyCredential;
 }
 
+/**
+ * Builds the `response` object on the matching native prototype, so libraries
+ * that gate on `instanceof AuthenticatorAttestationResponse` (or the assertion
+ * equivalent) accept it.
+ *
+ * Properties are installed with `defineProperty`, never `Object.assign`. Those
+ * prototypes expose `clientDataJSON` and friends as getter-only accessors;
+ * assignment walks the chain, finds an accessor with no setter, and throws in
+ * strict mode. Defining own data properties shadows the accessors instead.
+ */
+function buildResponse<T extends Record<string, unknown>>(
+    prototypeName: 'AuthenticatorAttestationResponse' | 'AuthenticatorAssertionResponse',
+    properties: T,
+): T {
+    const constructor = (window as unknown as Record<string, unknown>)[prototypeName] as
+        | (Function & { prototype: object })
+        | undefined;
+
+    // Absent outside a secure context; a plain object still works for every
+    // library that does not run the instanceof check.
+    const response = typeof constructor === 'function'
+        ? Object.create(constructor.prototype)
+        : {};
+
+    for (const [key, value] of Object.entries(properties)) {
+        Object.defineProperty(response, key, {
+            value,
+            enumerable: true,
+            configurable: true,
+        });
+    }
+    return response as T;
+}
+
 function buildAttestationCredential(result: SerializedAttestationResponse): PublicKeyCredential {
-    const response = {
+    const response = buildResponse('AuthenticatorAttestationResponse', {
         clientDataJSON: toArrayBuffer(result.response.clientDataJSON),
         attestationObject: toArrayBuffer(result.response.attestationObject),
-        // SimpleWebAuthn and most server SDKs call these three during
-        // registration; omitting them breaks otherwise-valid integrations.
+        // SimpleWebAuthn and most server SDKs call these during registration;
+        // omitting them breaks otherwise-valid integrations.
         getTransports: () => [...result.response.transports],
         getAuthenticatorData: () => toArrayBuffer(result.response.authenticatorData),
         getPublicKey: () => (result.response.publicKey ? toArrayBuffer(result.response.publicKey) : null),
         getPublicKeyAlgorithm: () => result.response.publicKeyAlgorithm,
-    };
+    });
     return buildCredential(result, response);
 }
 
 function buildAssertionCredential(result: SerializedAssertionResponse): PublicKeyCredential {
-    const response = {
+    const response = buildResponse('AuthenticatorAssertionResponse', {
         clientDataJSON: toArrayBuffer(result.response.clientDataJSON),
         authenticatorData: toArrayBuffer(result.response.authenticatorData),
         signature: toArrayBuffer(result.response.signature),
         userHandle: result.response.userHandle ? toArrayBuffer(result.response.userHandle) : null,
-    };
+    });
     return buildCredential(result, response);
 }
 

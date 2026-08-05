@@ -36,7 +36,8 @@ function styleSheet(): string {
     return `
         ${BASE_FONT_STYLE}
         .menu {
-            position: absolute;
+            position: fixed;
+            pointer-events: auto;
             min-width: 280px;
             max-width: 380px;
             max-height: 320px;
@@ -151,6 +152,13 @@ export function isMenuOpen(): boolean {
 /**
  * Positions the menu under the anchor, flipping above it when the field sits
  * near the bottom of the viewport.
+ *
+ * Viewport coordinates with `position: fixed`, not document coordinates with
+ * `scrollX/scrollY`. When the page scrolls inside a sub-container rather than
+ * the window — the normal case in an app shell — `window.scrollY` stays 0 while
+ * the field's on-screen position changes, and a document-positioned menu drifts
+ * away from the field it belongs to. `getBoundingClientRect` is already
+ * viewport-relative, so this also drops the conversion entirely.
  */
 function position(menu: HTMLElement, anchor: HTMLElement): void {
     const rect = anchor.getBoundingClientRect();
@@ -158,11 +166,11 @@ function position(menu: HTMLElement, anchor: HTMLElement): void {
     const spaceBelow = window.innerHeight - rect.bottom;
 
     const top = spaceBelow < menuHeight && rect.top > menuHeight
-        ? rect.top + window.scrollY - menuHeight - 4
-        : rect.bottom + window.scrollY + 4;
+        ? rect.top - menuHeight - 4
+        : rect.bottom + 4;
 
     menu.style.top = `${top}px`;
-    menu.style.left = `${rect.left + window.scrollX}px`;
+    menu.style.left = `${rect.left}px`;
     menu.style.minWidth = `${Math.max(rect.width, 280)}px`;
 }
 
@@ -171,7 +179,9 @@ export function showMenu(options: MenuOptions): void {
 
     const host = document.createElement('div');
     host.id = HOST_ID;
-    host.setAttribute('style', `${HOST_RESET} position: absolute; top: 0; left: 0;`);
+    // The host is a zero-size anchor for a fixed-positioned menu; it must not
+    // intercept pointer events meant for the page underneath.
+    host.setAttribute('style', `${HOST_RESET} top: 0; left: 0; pointer-events: none;`);
     const root = host.attachShadow({ mode: 'closed' });
 
     const style = document.createElement('style');

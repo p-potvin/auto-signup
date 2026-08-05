@@ -4,15 +4,22 @@
 
 Identity vault, passkey authenticator, and auto-signup extension for Firefox 128+
 and Chrome. Detects login and sign-up forms, suggests vault entries, and acts as
-a full WebAuthn authenticator so passkeys live in the encrypted vault instead of
-a single device.
+a WebAuthn authenticator so passkeys are held in the encrypted vault rather than
+in the browser profile.
 
 ## Capabilities
 
 - **Passkeys.** Replaces `navigator.credentials` to create and assert real
   WebAuthn credentials (ES256), with the private keys sealed in the vault. Every
   ceremony needs explicit consent, and the browser or a security key is always
-  one click away. Design and open gaps: `docs/passkeys.md`.
+  one click away.
+
+  Scope: modal registration and authentication ceremonies. Conditional mediation
+  (passkeys in the autofill dropdown), hybrid/cross-device transport, and
+  WebAuthn extensions are **not** implemented. The vault is local to one machine
+  — sync targets a `vault-warden` on the same host — so a passkey created here is
+  **not** available on your other devices. Design and open gaps:
+  `docs/passkeys.md`.
 - **Identities.** Personas are created and edited by hand; AI generation is an
   optional convenience over the same editor and is never required.
 - **Autofill.** Detects credential forms across shadow roots and late-rendered
