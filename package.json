@@ -8,7 +8,10 @@
     "dev": "webpack --mode development --watch",
     "clean": "rimraf dist",
     "typecheck": "tsc --noEmit",
-    "test:webauthn": "node test/webauthn-conformance.mjs"
+    "test:webauthn": "node test/webauthn-conformance.mjs",
+    "test:import": "node test/import-parsers.mjs",
+    "test:domain": "node test/domain-matching.mjs",
+    "test": "npm run typecheck && npm run test:domain && npm run test:import && npm run test:webauthn"
   },
   "dependencies": {
     "@noble/ciphers": "^1.0.0",

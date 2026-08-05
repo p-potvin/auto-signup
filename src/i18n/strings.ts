@@ -113,6 +113,18 @@ const STRINGS = {
         en: 'This site',
         qc: 'Ce site',
     },
+    menuGeneratePassword: {
+        en: 'Use a generated password',
+        qc: 'Utiliser un mot de passe généré',
+    },
+    menuGeneratePasswordHint: {
+        en: 'Fills every password field and copies it',
+        qc: 'Remplit tous les champs et le copie',
+    },
+    menuGenerateBadge: {
+        en: 'New',
+        qc: 'Nouveau',
+    },
 
     /* --------------------------------------------------- save-login prompt */
     savePromptTitle: {

@@ -41,6 +41,7 @@ export type MessageType =
     | 'WEBAUTHN_CREATE'
     | 'WEBAUTHN_GET'
     | 'OPEN_VAULT_UNLOCK'
+    | 'OPEN_VAULT'
     | 'GET_SYNC_STATUS'
     | 'GET_PAGE_IDENTITIES'
     | 'TOUCH_IDENTITY'
@@ -71,6 +72,57 @@ export interface MessageResponse {
 }
 
 let lockTimer: ReturnType<typeof setTimeout> | null = null;
+
+/* --------------------------------------------------------- vault tab */
+
+/**
+ * Opens the vault, reusing the tab if one is already open.
+ *
+ * Every entry point used to call `chrome.tabs.create`, so following a few
+ * "create item for this site" links left a row of identical vault tabs, each
+ * with its own unlock state and stale item list.
+ */
+async function openVaultTab(query = ''): Promise<void> {
+    const url = chrome.runtime.getURL(`vault.html${query}`);
+    const existing = await chrome.tabs.query({ url: chrome.runtime.getURL('vault.html') + '*' });
+
+    const tab = existing[0];
+    if (tab?.id !== undefined) {
+        await chrome.tabs.update(tab.id, { url, active: true });
+        if (tab.windowId !== undefined) {
+            await chrome.windows.update(tab.windowId, { focused: true });
+        }
+        return;
+    }
+    await chrome.tabs.create({ url });
+}
+
+/* ------------------------------------------------------- toolbar cue */
+
+let badgeTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * Marks a successful save on the toolbar icon.
+ *
+ * Deliberately a small dot rather than a count or a word: it should read as
+ * "that worked" at a glance and not demand attention. It lingers well past a
+ * toast because the user is usually still on the page, mid-flow, and looks up
+ * only after finishing what they were doing.
+ */
+function flashSavedBadge(): void {
+    if (badgeTimer) clearTimeout(badgeTimer);
+
+    void chrome.action.setBadgeText({ text: '•' });
+    void chrome.action.setBadgeBackgroundColor({ color: '#D6A441' });
+    if (chrome.action.setBadgeTextColor) {
+        void chrome.action.setBadgeTextColor({ color: '#0b0813' });
+    }
+
+    badgeTimer = setTimeout(() => {
+        void chrome.action.setBadgeText({ text: '' });
+        badgeTimer = null;
+    }, 20_000);
+}
 
 function resetLockTimer(): void {
     if (lockTimer) clearTimeout(lockTimer);
@@ -190,6 +242,7 @@ async function handleCreateItem(payload: { itemType: ItemType; data: VaultItemDa
 
         await saveEncryptedItem(encrypted);
         await enqueueCreate(encrypted);
+        flashSavedBadge();
 
         return { success: true, data: item };
     } catch (e) {
@@ -224,6 +277,7 @@ async function handleUpdateItem(payload: { id: string; data: VaultItemData; meta
         const encrypted = createEnvelope(updated, kemPubKey, sigKp.secretKey, keychain.deviceId);
         await saveEncryptedItem(encrypted);
         await enqueueUpdate(encrypted);
+        flashSavedBadge();
 
         return { success: true, data: updated };
     } catch (e) {
@@ -335,44 +389,46 @@ async function handleGetPageMatches(payload: { url: string }): Promise<MessageRe
         const masterKey = await getCachedMasterKey();
         if (!masterKey) return { success: true, data: [], locked: true };
 
-        const { normalizeDomain, domainMatches, urlMatches } = await import('../utils/domain');
-        const pageDomain = normalizeDomain(payload.url);
+        const { matchStrength, MATCH_NONE } = await import('../utils/domain');
 
-        const exactMatches: VaultItem[] = [];
-        const fuzzyMatches: VaultItem[] = [];
+        // Ranked, not filtered: a credential saved for this exact subdomain
+        // should outrank one saved for a sibling of the same parent domain.
+        const scored: { item: VaultItem; strength: number }[] = [];
 
         for (const enc of items) {
             if (enc.deletedAt) continue;
-            const itemDomain = enc.envelope.metadata.domain || '';
-            const isExact = itemDomain === pageDomain;
-            const isFuzzy = !isExact && domainMatches(itemDomain, payload.url);
 
-            if (isExact || isFuzzy) {
+            let strength = matchStrength(enc.envelope.metadata.domain || '', payload.url);
+
+            // The stored URL can be more specific than metadata.domain, which
+            // older versions flattened to the registrable domain.
+            let item: VaultItem | null = null;
+            if (enc.envelope.itemType === 'login' || strength > MATCH_NONE) {
                 try {
-                    const item = openEnvelope(enc, kemSecretKey, sigKp.publicKey);
-                    if (isExact) exactMatches.push(item);
-                    else fuzzyMatches.push(item);
+                    item = openEnvelope(enc, kemSecretKey, sigKp.publicKey);
                 } catch (e) {
                     console.error('Failed to decrypt item:', enc.id, e);
+                    continue;
                 }
-                continue;
+            }
+            if (!item) continue;
+
+            if (item.itemType === 'login') {
+                const login = item.data as import('../types').LoginItem;
+                if (login.url) {
+                    strength = Math.max(strength, matchStrength(login.url, payload.url));
+                }
             }
 
-            if (enc.envelope.itemType === 'login') {
-                try {
-                    const item = openEnvelope(enc, kemSecretKey, sigKp.publicKey);
-                    const loginData = item.data as import('../types').LoginItem;
-                    if (loginData.url && urlMatches(loginData.url, payload.url)) {
-                        fuzzyMatches.push(item);
-                    }
-                } catch (e) {
-                    console.error('Failed to decrypt item:', enc.id, e);
-                }
-            }
+            if (strength > MATCH_NONE) scored.push({ item, strength });
         }
 
-        const allMatches = [...exactMatches, ...fuzzyMatches];
-        return { success: true, data: allMatches };
+        scored.sort((a, b) => {
+            if (a.strength !== b.strength) return b.strength - a.strength;
+            return (b.item.lastUsedAt ?? '').localeCompare(a.item.lastUsedAt ?? '');
+        });
+
+        return { success: true, data: scored.map(s => s.item) };
     } catch (e) {
         return { success: false, error: (e as Error).message };
     }
@@ -497,6 +553,7 @@ async function handleCreateIdentity(payload: { data: GeneratedIdentityData }): P
         const identity = createIdentityObject(payload.data, keychain.deviceId);
         const encrypted = encryptIdentity(identity, kemPubKey, sigKp.secretKey, keychain.deviceId);
         await saveEncryptedIdentity(encrypted);
+        flashSavedBadge();
 
         return { success: true, data: identity };
     } catch (e) {
@@ -944,7 +1001,11 @@ chrome.runtime.onMessage.addListener((message: Message, sender, sendResponse) =>
                 response = await handleGetPageMatches(message.payload);
                 break;
             case 'OPEN_POPUP_CREATE':
-                chrome.tabs.create({ url: chrome.runtime.getURL('vault.html?action=create&url=' + encodeURIComponent(message.payload?.url || '')) });
+                await openVaultTab('?action=create&url=' + encodeURIComponent(message.payload?.url || ''));
+                response = { success: true };
+                break;
+            case 'OPEN_VAULT':
+                await openVaultTab(message.payload?.query ?? '');
                 response = { success: true };
                 break;
             case 'GET_IDENTITIES':
@@ -981,7 +1042,7 @@ chrome.runtime.onMessage.addListener((message: Message, sender, sendResponse) =>
                 response = await handleWebAuthnGet(message.payload);
                 break;
             case 'OPEN_VAULT_UNLOCK':
-                chrome.tabs.create({ url: chrome.runtime.getURL('vault.html?action=unlock') });
+                await openVaultTab('?action=unlock');
                 response = { success: true };
                 break;
             case 'GET_SYNC_STATUS':

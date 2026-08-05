@@ -6,12 +6,13 @@ import {
 } from 'lucide-react';
 import type { VaultItem, ItemType, VaultSettings, LoginItem, AddressItem, CardItem, TotpItem, PasskeyItem, Identity, GeneratedIdentityData } from '../types';
 import type { SyncStatus } from '../background';
-import { DEFAULT_SETTINGS } from '../types';
+import { DEFAULT_SETTINGS, loginIdentifier } from '../types';
 import { generatePassword, generatePassphrase, generateToken, generateFromPreset, measurePasswordStrength, strengthLabel, strengthColor, PRESETS, type GeneratorPreset, type PasswordOptions, type PassphraseOptions } from '../utils/password-generator';
 import { generateTotpCode, getTotpRemainingSeconds } from '../utils/totp';
-import { normalizeDomain, getFaviconUrl, getInitials } from '../utils/domain';
+import { normalizeDomain, getHost, getFaviconUrl, getInitials, normalizeStoredUrl } from '../utils/domain';
 import { t } from '../i18n/strings';
 import { useAutoUnlock } from '../utils/use-auto-unlock';
+import { ImportPanel } from './ImportPanel';
 
 /** A blank persona for the manual create path — no generation service involved. */
 function emptyIdentityData(): GeneratedIdentityData {
@@ -70,7 +71,9 @@ export default function App() {
     const [error, setError] = useState('');
     const [items, setItems] = useState<VaultItem[]>([]);
     const [identities, setIdentities] = useState<Identity[]>([]);
-    const [tab, setTab] = useState<Tab>('identities');
+    // The all-items view is what people open the vault for; identities are a
+    // secondary workflow.
+    const [tab, setTab] = useState<Tab>('all');
     const [search, setSearch] = useState('');
     const [editingItem, setEditingItem] = useState<VaultItem | null>(null);
     const [creatingType, setCreatingType] = useState<ItemType | null>(null);
@@ -81,6 +84,7 @@ export default function App() {
     const [dataLoading, setDataLoading] = useState(false);
     const [syncing, setSyncing] = useState(false);
     const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
+    const [pendingItemId, setPendingItemId] = useState<string | null>(null);
     const [selectedIdentity, setSelectedIdentity] = useState<Identity | null>(null);
     const [generatingIdentity, setGeneratingIdentity] = useState(false);
     const [identityEditor, setIdentityEditor] = useState<IdentityEditorState | null>(null);
@@ -142,7 +146,31 @@ export default function App() {
                 setPrefillUrl(url);
             }
         }
+        // Opened from the popup by clicking an item.
+        setPendingItemId(params.get('item'));
     }, [unlocked, loadItems, loadIdentities, loadSettings]);
+
+    // The deep-linked item can only be opened once the list has decrypted.
+    useEffect(() => {
+        if (!pendingItemId || items.length === 0) return;
+        const target = items.find(i => i.id === pendingItemId);
+        if (target) setEditingItem(target);
+        setPendingItemId(null);
+    }, [pendingItemId, items]);
+
+    /**
+     * "New Item" from a type-specific list creates that type directly. Being
+     * dropped into a type picker after clicking New Item on the Cards tab is a
+     * reliable way to end up with a login you did not want.
+     */
+    const startNewItem = () => {
+        const tabTypes: Partial<Record<Tab, ItemType>> = {
+            logins: 'login', addresses: 'address', cards: 'card', totp: 'totp',
+        };
+        const type = tabTypes[tab];
+        if (type) setCreatingType(type);
+        else setShowTypeSelector(true);
+    };
 
     const handleUnlocked = useCallback(() => {
         setUnlocked(true);
@@ -326,7 +354,9 @@ export default function App() {
                             autoFocus
                         />
                         {autoChecking && (
-                            <Loader2 className="w-4 h-4 text-vw-gold animate-spin absolute right-4 top-1/2 -translate-y-1/2" />
+                            <span className="absolute right-4 top-1/2 -translate-y-1/2 flex items-center">
+                                <Loader2 className="w-4 h-4 text-vw-gold animate-spin" />
+                            </span>
                         )}
                     </div>
                     {error && <p className="text-sm text-vw-signal-alert mb-3">{error}</p>}
@@ -575,7 +605,7 @@ export default function App() {
                                         />
                                     </div>
                                     <button
-                                        onClick={() => setShowTypeSelector(true)}
+                                        onClick={startNewItem}
                                         className="flex items-center gap-2 px-4 py-2 bg-vw-gold text-vw-console-bg rounded-lg text-sm font-medium hover:bg-[#C69431]"
                                     >
                                         <Plus className="w-4 h-4" />
@@ -628,7 +658,12 @@ export default function App() {
                     )}
 
                     {tab === 'generator' && <PasswordGeneratorPanel settings={settings} />}
-                    {tab === 'settings' && <SettingsPanel settings={settings} onSave={async (s) => { await send({ type: 'SAVE_SETTINGS', payload: s }); setSettings(s); }} />}
+                    {tab === 'settings' && (
+                        <div className="space-y-6">
+                            <SettingsPanel settings={settings} onSave={async (s) => { await send({ type: 'SAVE_SETTINGS', payload: s }); setSettings(s); }} />
+                            <ImportPanel existingItems={items} onImported={loadItems} />
+                        </div>
+                    )}
                     {tab === 'devices' && <DevicesPanel />}
                 </div>
             </main>
@@ -674,7 +709,7 @@ function ItemCard({ item, onClick }: { item: VaultItem; onClick: () => void }) {
                         {item.metadata.favorite && <Star className="w-3 h-3 text-vw-gold fill-vw-gold flex-shrink-0" />}
                     </div>
                     <p className="text-xs text-vw-console-text-secondary truncate mt-0.5">
-                        {item.itemType === 'login' && (item.data as LoginItem).username}
+                        {item.itemType === 'login' && loginIdentifier(item.data as LoginItem)}
                         {item.itemType === 'address' && `${(item.data as AddressItem).fullName}`}
                         {item.itemType === 'card' && `•••• ${(item.data as CardItem).cardNumber.slice(-4)}`}
                         {item.itemType === 'totp' && (item.data as TotpItem).issuer || (item.data as TotpItem).label}
@@ -721,7 +756,16 @@ function ItemEditor({ item, itemType, onSave, onCancel, onDelete, prefillUrl }: 
     const [favorite, setFavorite] = useState(item?.metadata.favorite ?? false);
     const [showPassword, setShowPassword] = useState(false);
 
-    const [loginData, setLoginData] = useState<LoginItem>(item?.itemType === 'login' ? item.data as LoginItem : { url: prefillUrl || '', username: '', password: '', notes: '', totpSecret: '' });
+    const [loginData, setLoginData] = useState<LoginItem>(
+        item?.itemType === 'login'
+            ? item.data as LoginItem
+            : { url: normalizeStoredUrl(prefillUrl || ''), username: '', email: '', password: '', notes: '', totpSecret: '' },
+    );
+    // Most sites want an email, so the username box stays out of the way until
+    // it is needed — and appears on its own once either field holds something.
+    const [showUsernameField, setShowUsernameField] = useState(
+        !!(item?.itemType === 'login' && (item.data as LoginItem).username),
+    );
     const [addressData, setAddressData] = useState<AddressItem>(item?.itemType === 'address' ? item.data as AddressItem : { fullName: '', street: '', city: '', state: '', zipCode: '', country: '', phone: '' });
     const [cardData, setCardData] = useState<CardItem>(item?.itemType === 'card' ? item.data as CardItem : { holderName: '', cardNumber: '', expiryMonth: '', expiryYear: '', cvv: '', notes: '' });
     const [totpData, setTotpData] = useState<TotpItem>(item?.itemType === 'totp' ? item.data as TotpItem : { label: '', secret: '', issuer: '', digits: 6, period: 30, algorithm: 'SHA1' });
@@ -742,7 +786,7 @@ function ItemEditor({ item, itemType, onSave, onCancel, onDelete, prefillUrl }: 
 
     const getDefaultLabel = () => {
         switch (itemType) {
-            case 'login': return normalizeDomain(loginData.url) || loginData.username || 'Login';
+            case 'login': return getHost(loginData.url) || loginIdentifier(loginData) || 'Login';
             case 'address': return addressData.fullName || 'Address';
             case 'card': return cardData.holderName || 'Card';
             case 'totp': return totpData.label || totpData.issuer || 'TOTP';
@@ -751,7 +795,7 @@ function ItemEditor({ item, itemType, onSave, onCancel, onDelete, prefillUrl }: 
     };
 
     const getDomain = () => {
-        if (itemType === 'login') return normalizeDomain(loginData.url);
+        if (itemType === 'login') return getHost(loginData.url);
         if (itemType === 'passkey') return passkeyData.rpId;
         return undefined;
     };
@@ -782,12 +826,42 @@ function ItemEditor({ item, itemType, onSave, onCancel, onDelete, prefillUrl }: 
                         <>
                             <div>
                                 <label className={labelClass}>URL</label>
-                                <input className={inputClass} value={loginData.url} onChange={(e) => setLoginData({ ...loginData, url: e.target.value })} placeholder="https://example.com" />
+                                <input
+                                    className={inputClass}
+                                    value={loginData.url}
+                                    onChange={(e) => setLoginData({ ...loginData, url: e.target.value })}
+                                    onBlur={(e) => setLoginData({ ...loginData, url: normalizeStoredUrl(e.target.value) })}
+                                    placeholder="app.example.com"
+                                />
                             </div>
                             <div>
-                                <label className={labelClass}>Username or Email</label>
-                                <input className={inputClass} value={loginData.username} onChange={(e) => setLoginData({ ...loginData, username: e.target.value })} />
+                                <label className={labelClass}>Email</label>
+                                <input
+                                    className={inputClass}
+                                    type="email"
+                                    value={loginData.email ?? ''}
+                                    onChange={(e) => setLoginData({ ...loginData, email: e.target.value })}
+                                    placeholder="you@example.com"
+                                />
                             </div>
+                            {showUsernameField ? (
+                                <div>
+                                    <label className={labelClass}>Username</label>
+                                    <input
+                                        className={inputClass}
+                                        value={loginData.username}
+                                        onChange={(e) => setLoginData({ ...loginData, username: e.target.value })}
+                                        autoFocus={!loginData.username}
+                                    />
+                                </div>
+                            ) : (
+                                <button
+                                    onClick={() => setShowUsernameField(true)}
+                                    className="text-xs text-vw-gold hover:underline"
+                                >
+                                    + username
+                                </button>
+                            )}
                             <div>
                                 <label className={labelClass}>Password</label>
                                 <div className="flex gap-2">
@@ -850,36 +924,31 @@ function ItemEditor({ item, itemType, onSave, onCancel, onDelete, prefillUrl }: 
                         </>
                     )}
 
+                    {/*
+                        A passkey is key material, not a setting. There is no
+                        repair you can perform on one by typing — a wrong byte
+                        produces a signature the site rejects, with nothing to
+                        tell you why. So it is a read-only record: look at it,
+                        annotate it, or delete it and register again on the site.
+                    */}
                     {itemType === 'passkey' && (
-                        passkeyData.createdByAuthenticator ? (
-                            /* Created by the built-in authenticator. The key material is
-                               what the site verifies against, so it is shown read-only —
-                               editing any of it would silently break sign-in. */
-                            <>
-                                <div className="flex items-center gap-2 px-3 py-2 rounded-lg border border-vw-console-border bg-vw-console-surface text-xs text-vw-console-text-secondary">
-                                    <Fingerprint className="w-4 h-4 text-vw-violet flex-shrink-0" />
-                                    <span>Created by VaultWares on {passkeyData.createdAt ? new Date(passkeyData.createdAt).toLocaleDateString() : 'this device'}. Key material is read-only.</span>
-                                </div>
-                                <div><label className={labelClass}>Relying Party</label><input className={inputClass} value={passkeyData.rpName || passkeyData.rpId} readOnly /></div>
-                                <div><label className={labelClass}>Relying Party ID</label><input className={`${inputClass} font-mono`} value={passkeyData.rpId} readOnly /></div>
-                                <div><label className={labelClass}>Account</label><input className={inputClass} value={passkeyData.userDisplayName || passkeyData.userName || ''} readOnly /></div>
-                                <div><label className={labelClass}>Credential ID</label><input className={`${inputClass} font-mono`} value={passkeyData.credentialId} readOnly /></div>
-                                <div><label className={labelClass}>Algorithm</label><input className={inputClass} value={passkeyData.algorithm === -7 ? 'ES256 (ECDSA P-256)' : String(passkeyData.algorithm ?? '')} readOnly /></div>
-                                <div><label className={labelClass}>Notes</label><textarea className={inputClass} rows={2} value={passkeyData.notes ?? ''} onChange={(e) => setPasskeyData({ ...passkeyData, notes: e.target.value })} /></div>
-                            </>
-                        ) : (
-                            <>
-                                <div className="flex items-start gap-2 px-3 py-2 rounded-lg border border-vw-console-border bg-vw-console-surface text-xs text-vw-signal-warning">
-                                    <AlertCircle className="w-4 h-4 flex-shrink-0 mt-px" />
-                                    <span>Imported passkeys are stored but cannot be used to sign in — the authenticator only asserts with credentials it created.</span>
-                                </div>
-                                <div><label className={labelClass}>Relying Party ID</label><input className={inputClass} value={passkeyData.rpId} onChange={(e) => setPasskeyData({ ...passkeyData, rpId: e.target.value })} placeholder="example.com" /></div>
-                                <div><label className={labelClass}>Credential ID</label><input className={`${inputClass} font-mono`} value={passkeyData.credentialId} onChange={(e) => setPasskeyData({ ...passkeyData, credentialId: e.target.value })} /></div>
-                                <div><label className={labelClass}>Private Key</label><textarea className={`${inputClass} font-mono`} rows={3} value={passkeyData.privateKey} onChange={(e) => setPasskeyData({ ...passkeyData, privateKey: e.target.value })} /></div>
-                                <div><label className={labelClass}>User Handle</label><input className={inputClass} value={passkeyData.userHandle} onChange={(e) => setPasskeyData({ ...passkeyData, userHandle: e.target.value })} /></div>
-                                <div><label className={labelClass}>Notes</label><textarea className={inputClass} rows={2} value={passkeyData.notes ?? ''} onChange={(e) => setPasskeyData({ ...passkeyData, notes: e.target.value })} /></div>
-                            </>
-                        )
+                        <>
+                            <div className="flex items-start gap-2 px-3 py-2 rounded-lg border border-vw-console-border bg-vw-console-surface text-xs text-vw-console-text-secondary">
+                                <Fingerprint className="w-4 h-4 text-vw-violet flex-shrink-0 mt-px" />
+                                <span>
+                                    {passkeyData.createdByAuthenticator
+                                        ? `Created by VaultWares${passkeyData.createdAt ? ' on ' + new Date(passkeyData.createdAt).toLocaleDateString() : ''}.`
+                                        : 'Imported passkey.'}
+                                    {' '}Key material is read-only. To replace it, delete this passkey and register a new one on the site.
+                                </span>
+                            </div>
+                            <div><label className={labelClass}>Relying Party</label><input className={inputClass} value={passkeyData.rpName || passkeyData.rpId} readOnly /></div>
+                            <div><label className={labelClass}>Relying Party ID</label><input className={`${inputClass} font-mono`} value={passkeyData.rpId} readOnly /></div>
+                            <div><label className={labelClass}>Account</label><input className={inputClass} value={passkeyData.userDisplayName || passkeyData.userName || ''} readOnly /></div>
+                            <div><label className={labelClass}>Credential ID</label><input className={`${inputClass} font-mono`} value={passkeyData.credentialId} readOnly /></div>
+                            <div><label className={labelClass}>Algorithm</label><input className={inputClass} value={passkeyData.algorithm === -7 ? 'ES256 (ECDSA P-256)' : String(passkeyData.algorithm ?? '')} readOnly /></div>
+                            <div><label className={labelClass}>Notes</label><textarea className={inputClass} rows={2} value={passkeyData.notes ?? ''} onChange={(e) => setPasskeyData({ ...passkeyData, notes: e.target.value })} /></div>
+                        </>
                     )}
 
                     <div className="flex items-center gap-2">
@@ -1079,7 +1148,9 @@ function ItemTypeSelector({ onSelect, onCancel }: {
         { type: 'address', label: 'Address', icon: <MapPin className="w-6 h-6" />, desc: 'Full postal address' },
         { type: 'card', label: 'Card', icon: <CreditCard className="w-6 h-6" />, desc: 'Credit/debit card details' },
         { type: 'totp', label: 'TOTP', icon: <Clock className="w-6 h-6" />, desc: 'Authenticator secret' },
-        { type: 'passkey', label: 'Passkey', icon: <Fingerprint className="w-6 h-6" />, desc: 'WebAuthn credential' },
+        // Passkeys are deliberately absent: they are created by the
+        // authenticator during a real ceremony on the site, and a hand-typed
+        // credential cannot produce a signature any relying party accepts.
     ];
 
     return (

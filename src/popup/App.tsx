@@ -5,8 +5,9 @@ import {
 } from 'lucide-react';
 import { generatePassword, measurePasswordStrength, strengthLabel, strengthColor } from '../utils/password-generator';
 import { generateTotpCode, getTotpRemainingSeconds } from '../utils/totp';
-import { normalizeDomain, getFaviconUrl } from '../utils/domain';
-import type { VaultItem, LoginItem, TotpItem, VaultItemMetadata, Identity } from '../types';
+import { normalizeDomain, getHost, getFaviconUrl, normalizeStoredUrl } from '../utils/domain';
+import { loginIdentifier } from '../types';
+import type { VaultItem, LoginItem, TotpItem, VaultItemMetadata, Identity, VaultSettings } from '../types';
 
 import { useAutoUnlock } from '../utils/use-auto-unlock';
 
@@ -80,7 +81,11 @@ export default function App() {
 
     const generateNewPassword = async () => {
         const { generateFromPreset, PRESETS } = await import('../utils/password-generator');
-        const preset = PRESETS[0];
+        // Honour the configured default; hardcoding PRESETS[0] meant the popup
+        // handed out passwords in a different shape from the vault generator.
+        const settingsResp = await send<VaultSettings>({ type: 'GET_SETTINGS' });
+        const presetId = settingsResp.data?.defaultGeneratorPreset;
+        const preset = PRESETS.find(p => p.id === presetId) ?? PRESETS[0];
         setPassword(await generateFromPreset(preset));
     };
 
@@ -114,8 +119,13 @@ export default function App() {
         }
     };
 
+    const openItemInVault = (item: VaultItem) => {
+        void send({ type: 'OPEN_VAULT', payload: { query: `?item=${encodeURIComponent(item.id)}` } });
+        window.close();
+    };
+
     const openVault = () => {
-        chrome.tabs.create({ url: chrome.runtime.getURL('vault.html') });
+        void send({ type: 'OPEN_VAULT' });
         window.close();
     };
 
@@ -128,22 +138,23 @@ export default function App() {
         if (!currentTab?.url) return;
         setCreating(true);
         const tabUrl = currentTab.url;
-        const tabDomain = normalizeDomain(tabUrl);
+        const tabHost = getHost(tabUrl);
         const favicon = getFaviconUrl(tabUrl);
         const generatedPw = password || await (async () => {
             const { generateFromPreset, PRESETS } = await import('../utils/password-generator');
             return generateFromPreset(PRESETS[0]);
         })();
         const data: LoginItem = {
-            url: tabUrl,
+            url: normalizeStoredUrl(tabUrl),
             username: '',
+            email: '',
             password: generatedPw,
             notes: '',
             totpSecret: '',
         };
         const metadata: VaultItemMetadata = {
-            label: tabDomain || 'New Login',
-            domain: tabDomain,
+            label: tabHost || 'New Login',
+            domain: tabHost,
             iconRef: favicon,
             tags: [],
             favorite: false,
@@ -166,9 +177,9 @@ export default function App() {
         chrome.tabs.sendMessage(tab.id, {
             type: 'AUTOFILL',
             payload: {
-                username: login.username,
+                username: login.username || login.email || '',
+                email: login.email || login.username || '',
                 password: login.password,
-                email: login.username,
                 totp: login.totpSecret || '',
             },
         });
@@ -223,7 +234,9 @@ export default function App() {
                             autoFocus
                         />
                         {autoChecking && (
-                            <Loader2 className="w-4 h-4 text-vw-gold animate-spin absolute right-3.5 top-1/2 -translate-y-1/2" />
+                            <span className="absolute right-3.5 top-1/2 -translate-y-1/2 flex items-center">
+                                <Loader2 className="w-4 h-4 text-vw-gold animate-spin" />
+                            </span>
                         )}
                     </div>
                     {error && <p className="text-xs text-vw-signal-alert mb-2">{error}</p>}
@@ -313,7 +326,7 @@ export default function App() {
                                                 <span className="text-[10px] font-medium text-vw-console-text-secondary truncate">{identity.fullName}</span>
                                             </div>
                                             {idMatches.slice(0, 3).map((item) => (
-                                                <PopupItemRow key={item.id} item={item} onAutofill={handleAutofill} />
+                                                <PopupItemRow key={item.id} item={item} onAutofill={handleAutofill} onOpen={openItemInVault} />
                                             ))}
                                         </div>
                                     );
@@ -322,7 +335,7 @@ export default function App() {
                                     <div className="border-t border-vw-console-border pt-1" />
                                 )}
                                 {sortedUnassigned.slice(0, 5).map((item) => (
-                                    <PopupItemRow key={item.id} item={item} onAutofill={handleAutofill} />
+                                    <PopupItemRow key={item.id} item={item} onAutofill={handleAutofill} onOpen={openItemInVault} />
                                 ))}
                             </div>
                         </div>
@@ -401,7 +414,11 @@ export default function App() {
     );
 }
 
-function PopupItemRow({ item, onAutofill }: { item: VaultItem; onAutofill: (item: VaultItem) => void }) {
+function PopupItemRow({ item, onAutofill, onOpen }: {
+    item: VaultItem;
+    onAutofill: (item: VaultItem) => void;
+    onOpen: (item: VaultItem) => void;
+}) {
     const [showTotp, setShowTotp] = useState(false);
     const [totpCode, setTotpCode] = useState('');
     const [totpSeconds, setTotpSeconds] = useState(30);
@@ -430,7 +447,14 @@ function PopupItemRow({ item, onAutofill }: { item: VaultItem; onAutofill: (item
     };
 
     return (
-        <div className="flex items-center gap-2.5 p-2 bg-vw-console-surface rounded-lg hover:bg-vw-console-raised transition-colors cursor-pointer group">
+        <div
+            role="button"
+            tabIndex={0}
+            onClick={() => onOpen(item)}
+            onKeyDown={(e) => { if (e.key === 'Enter') onOpen(item); }}
+            title="Open in vault"
+            className="flex items-center gap-2.5 p-2 bg-vw-console-surface rounded-lg hover:bg-vw-console-raised transition-colors cursor-pointer group"
+        >
             <div className="w-7 h-7 rounded bg-vw-console-elevated flex items-center justify-center flex-shrink-0">
                 {item.metadata.iconRef ? (
                     <img src={item.metadata.iconRef} alt="" className="w-4 h-4 rounded" />
@@ -441,7 +465,7 @@ function PopupItemRow({ item, onAutofill }: { item: VaultItem; onAutofill: (item
             <div className="flex-1 min-w-0">
                 <div className="text-xs font-medium text-white truncate">{item.metadata.label}</div>
                 <div className="text-[10px] text-vw-console-text-secondary truncate">
-                    {loginData?.username || (item.data as TotpItem).issuer || item.itemType}
+                    {(loginData && loginIdentifier(loginData)) || (item.data as TotpItem).issuer || item.itemType}
                 </div>
             </div>
             {item.itemType === 'totp' && (
@@ -449,9 +473,9 @@ function PopupItemRow({ item, onAutofill }: { item: VaultItem; onAutofill: (item
                     <Clock className="w-3.5 h-3.5" />
                 </button>
             )}
-            {loginData?.username && (
+            {loginData && loginIdentifier(loginData) && (
                 <button
-                    onClick={(e) => copyField(e, loginData.username, 'username')}
+                    onClick={(e) => copyField(e, loginIdentifier(loginData), 'username')}
                     className="text-vw-console-text-secondary hover:text-white opacity-0 group-hover:opacity-100 transition-opacity"
                     title="Copy username"
                 >

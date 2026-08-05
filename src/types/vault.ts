@@ -1,11 +1,25 @@
 export type ItemType = 'login' | 'address' | 'card' | 'totp' | 'passkey';
 
+/**
+ * `url` is stored without a scheme (see `utils/domain.normalizeStoredUrl`).
+ *
+ * Email and username are separate because many sites accept one and not the
+ * other, and cramming both into one field means autofill has to guess. Either
+ * may be empty; `email` is the common case and the one the editor shows first.
+ * Records written before v2.1 have only `username`, which still loads.
+ */
 export interface LoginItem {
     url: string;
     username: string;
+    email?: string;
     password: string;
     notes?: string;
     totpSecret?: string;
+}
+
+/** The identifier to show for a login, preferring whichever is filled. */
+export function loginIdentifier(login: LoginItem): string {
+    return login.email || login.username || '';
 }
 
 export interface AddressItem {

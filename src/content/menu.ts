@@ -138,7 +138,7 @@ function styleSheet(): string {
     `;
 }
 
-let activeMenu: { host: HTMLElement; dispose: () => void } | null = null;
+let activeMenu: { host: HTMLElement; anchor: HTMLElement; dispose: () => void } | null = null;
 
 export function closeMenu(): void {
     activeMenu?.dispose();
@@ -147,6 +147,21 @@ export function closeMenu(): void {
 
 export function isMenuOpen(): boolean {
     return activeMenu !== null;
+}
+
+/**
+ * Whether the field the menu belongs to is still on the page and visible.
+ *
+ * The rescan used to close the menu whenever `document.activeElement` was not
+ * an input. On a framework-driven page a re-render moves focus for a tick, so
+ * the menu vanished a fraction of a second after opening. What actually matters
+ * is whether the anchor still exists.
+ */
+export function isAnchorAlive(): boolean {
+    const anchor = activeMenu?.anchor;
+    if (!anchor) return false;
+    if (!anchor.isConnected) return false;
+    return anchor.getClientRects().length > 0;
 }
 
 /**
@@ -281,6 +296,44 @@ export function showMenu(options: MenuOptions): void {
     document.documentElement.appendChild(host);
     position(menu, options.anchor);
 
+    /*
+     * Re-anchor once the menu's own box settles.
+     *
+     * The flip-above branch subtracts the menu height from the field's top, so
+     * a height measured before layout has settled places the menu visibly
+     * wrong. That happens routinely: the first measurement can be taken with a
+     * fallback font still in play, and the box shrinks when the real metrics
+     * arrive. A ResizeObserver catches any such reflow; the timeout covers the
+     * case where the box never changes size but the first read was early.
+     */
+    const resizeObserver = new ResizeObserver(() => position(menu, options.anchor));
+    resizeObserver.observe(menu);
+    const settleTimer = setTimeout(() => position(menu, options.anchor), 0);
+
+    /*
+     * The field can also move without any scroll or resize event: an image
+     * finishes loading, a banner appears, a validation message expands above
+     * the form. Nothing notifies us, and the menu would sit where the field
+     * used to be. A cheap poll re-anchors it — one getBoundingClientRect every
+     * quarter second, only while the menu is open.
+     */
+    let lastAnchorTop = options.anchor.getBoundingClientRect().top;
+    let lastMenuHeight = menu.getBoundingClientRect().height;
+
+    const driftTimer = setInterval(() => {
+        const top = options.anchor.getBoundingClientRect().top;
+        // Height matters as much as position: when the menu opens above the
+        // field, its top is the field's top minus its own height, so a box that
+        // settles to a different height after the first measurement leaves the
+        // menu floating away from the field.
+        const height = menu.getBoundingClientRect().height;
+
+        if (Math.abs(top - lastAnchorTop) < 0.5 && Math.abs(height - lastMenuHeight) < 0.5) return;
+        lastAnchorTop = top;
+        lastMenuHeight = height;
+        position(menu, options.anchor);
+    }, 250);
+
     /* ------------------------------------------------------- interaction */
 
     let activeIndex = -1;
@@ -338,11 +391,15 @@ export function showMenu(options: MenuOptions): void {
 
     activeMenu = {
         host,
+        anchor: options.anchor,
         dispose: () => {
             options.anchor.removeEventListener('keydown', onKeyDown, true);
             document.removeEventListener('pointerdown', onDocumentPointerDown, true);
             window.removeEventListener('scroll', reposition, true);
             window.removeEventListener('resize', reposition);
+            resizeObserver.disconnect();
+            clearTimeout(settleTimer);
+            clearInterval(driftTimer);
             host.remove();
         },
     };
