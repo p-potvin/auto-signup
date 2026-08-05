@@ -1,8 +1,8 @@
 {
     "manifest_version": 3,
     "name": "VaultWares — Identity Manager",
-    "version": "2.0.0",
-    "description": "PQC zero-knowledge password, identity, card, and TOTP vault with encrypted sync.",
+    "version": "2.1.0",
+    "description": "PQC zero-knowledge password, identity, passkey, card, and TOTP vault with encrypted sync.",
     "permissions": [
         "storage",
         "activeTab",
@@ -20,14 +20,30 @@
     "browser_specific_settings": {
         "gecko": {
             "id": "vault@vaultwares.com",
-            "strict_min_version": "121.0"
+            "comment": "128.0 is the first Firefox with content_scripts `world: MAIN`, which the passkey authenticator needs to replace navigator.credentials before page scripts capture it.",
+            "strict_min_version": "128.0"
         }
     },
     "content_scripts": [
         {
             "matches": ["<all_urls>"],
+            "js": ["webauthn-inject.js"],
+            "run_at": "document_start",
+            "world": "MAIN",
+            "all_frames": true
+        },
+        {
+            "matches": ["<all_urls>"],
+            "js": ["webauthn-bridge.js"],
+            "run_at": "document_start",
+            "world": "ISOLATED",
+            "all_frames": true
+        },
+        {
+            "matches": ["<all_urls>"],
             "js": ["content.js"],
-            "run_at": "document_idle"
+            "run_at": "document_idle",
+            "all_frames": true
         }
     ],
     "action": {

@@ -5,12 +5,51 @@ import {
     Download, Monitor, ChevronRight, Star, AlertCircle, Users, User, Sparkles
 } from 'lucide-react';
 import type { VaultItem, ItemType, VaultSettings, LoginItem, AddressItem, CardItem, TotpItem, PasskeyItem, Identity, GeneratedIdentityData } from '../types';
+import type { SyncStatus } from '../background';
 import { DEFAULT_SETTINGS } from '../types';
 import { generatePassword, generatePassphrase, generateToken, generateFromPreset, measurePasswordStrength, strengthLabel, strengthColor, PRESETS, type GeneratorPreset, type PasswordOptions, type PassphraseOptions } from '../utils/password-generator';
 import { generateTotpCode, getTotpRemainingSeconds } from '../utils/totp';
 import { normalizeDomain, getFaviconUrl, getInitials } from '../utils/domain';
+import { t } from '../i18n/strings';
+import { useAutoUnlock } from '../utils/use-auto-unlock';
 
-function send<T>(msg: { type: string; payload?: any }): Promise<{ success: boolean; data?: T; error?: string }> {
+/** A blank persona for the manual create path — no generation service involved. */
+function emptyIdentityData(): GeneratedIdentityData {
+    return {
+        fullName: '',
+        gender: 'other',
+        birthDate: '',
+        nationality: '',
+        bio: '',
+        email: '',
+        phone: '',
+        address: { fullName: '', street: '', city: '', state: '', zipCode: '', country: '', phone: '' },
+    };
+}
+
+function identityToEditable(identity: Identity): GeneratedIdentityData {
+    return {
+        fullName: identity.fullName,
+        gender: identity.gender,
+        birthDate: identity.birthDate,
+        nationality: identity.nationality,
+        bio: identity.bio,
+        email: identity.email,
+        phone: identity.phone,
+        address: { ...identity.address, phone: identity.address.phone ?? '' },
+    };
+}
+
+type IdentityEditorMode = 'create' | 'edit' | 'review';
+
+interface IdentityEditorState {
+    mode: IdentityEditorMode;
+    data: GeneratedIdentityData;
+    /** Set when editing an identity that already exists. */
+    identity: Identity | null;
+}
+
+function send<T>(msg: { type: string; payload?: any }): Promise<{ success: boolean; data?: T; error?: string; locked?: boolean }> {
     return chrome.runtime.sendMessage(msg);
 }
 
@@ -39,9 +78,13 @@ export default function App() {
     const [prefillUrl, setPrefillUrl] = useState('');
     const [settings, setSettings] = useState<VaultSettings | null>(null);
     const [loading, setLoading] = useState(false);
+    const [dataLoading, setDataLoading] = useState(false);
+    const [syncing, setSyncing] = useState(false);
+    const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
     const [selectedIdentity, setSelectedIdentity] = useState<Identity | null>(null);
     const [generatingIdentity, setGeneratingIdentity] = useState(false);
-    const [identityEditor, setIdentityEditor] = useState<GeneratedIdentityData | null>(null);
+    const [identityEditor, setIdentityEditor] = useState<IdentityEditorState | null>(null);
+    const [identityError, setIdentityError] = useState('');
 
     const checkInit = useCallback(async () => {
         const resp = await send<{ initialized: boolean }>({ type: 'INIT_CHECK' });
@@ -53,13 +96,21 @@ export default function App() {
         setUnlocked(resp.data?.unlocked ?? false);
     }, []);
 
+    /**
+     * A locked vault decrypts nothing, so it answers with an empty list. Taking
+     * that at face value paints the "no identities yet" empty state over a vault
+     * that is merely locked, which reads as data loss. Bounce to the unlock
+     * screen instead and leave the cached lists alone.
+     */
     const loadItems = useCallback(async () => {
         const resp = await send<VaultItem[]>({ type: 'GET_ITEMS' });
+        if (resp.locked) { setUnlocked(false); return; }
         if (resp.success && resp.data) setItems(resp.data);
     }, []);
 
     const loadIdentities = useCallback(async () => {
         const resp = await send<Identity[]>({ type: 'GET_IDENTITIES' });
+        if (resp.locked) { setUnlocked(false); return; }
         if (resp.success && resp.data) setIdentities(resp.data);
     }, []);
 
@@ -74,30 +125,47 @@ export default function App() {
     }, [checkInit, checkUnlocked]);
 
     useEffect(() => {
-        if (unlocked) {
-            loadItems();
-            loadIdentities();
-            loadSettings();
-            const params = new URLSearchParams(window.location.search);
-            if (params.get('action') === 'create') {
-                const url = params.get('url') || '';
-                if (url) {
-                    setCreatingType('login');
-                    setPrefillUrl(url);
-                }
+        if (!unlocked) return;
+
+        // Decryption is not instant. Without this flag the lists render as []
+        // first and the empty state flashes before the real data lands.
+        setDataLoading(true);
+        void Promise.all([loadItems(), loadIdentities(), loadSettings()])
+            .finally(() => setDataLoading(false));
+        void loadSyncStatus();
+
+        const params = new URLSearchParams(window.location.search);
+        if (params.get('action') === 'create') {
+            const url = params.get('url') || '';
+            if (url) {
+                setCreatingType('login');
+                setPrefillUrl(url);
             }
         }
     }, [unlocked, loadItems, loadIdentities, loadSettings]);
+
+    const handleUnlocked = useCallback(() => {
+        setUnlocked(true);
+        setPin('');
+        setError('');
+    }, []);
+
+    // Unlocks the moment the PIN is right, so no Enter press is needed.
+    const { checking: autoChecking } = useAutoUnlock({
+        enabled: initialized === true && !unlocked,
+        pin,
+        onUnlocked: handleUnlocked,
+    });
 
     const handleUnlock = async () => {
         setLoading(true);
         const resp = await send({ type: 'UNLOCK', payload: { pin } });
         setLoading(false);
         if (resp.success) {
-            setUnlocked(true);
-            setPin('');
-            setError('');
+            handleUnlocked();
         } else {
+            // Only an explicit submit reports failure; the background attempts
+            // stay silent so a half-typed PIN does not read as an error.
             setError(resp.error ?? 'Unlock failed');
         }
     };
@@ -106,12 +174,20 @@ export default function App() {
         await send({ type: 'LOCK' });
         setUnlocked(false);
         setItems([]);
+        setIdentities([]);
     };
 
+    const loadSyncStatus = useCallback(async () => {
+        const resp = await send<SyncStatus>({ type: 'GET_SYNC_STATUS' });
+        if (resp.success && resp.data) setSyncStatus(resp.data);
+    }, []);
+
     const handleSync = async () => {
-        setLoading(true);
-        await send({ type: 'SYNC' });
-        setLoading(false);
+        setSyncing(true);
+        const resp = await send<{ status: SyncStatus }>({ type: 'SYNC' });
+        setSyncing(false);
+        if (resp.data?.status) setSyncStatus(resp.data.status);
+        else await loadSyncStatus();
         await loadItems();
         await loadIdentities();
     };
@@ -133,21 +209,55 @@ export default function App() {
         await loadItems();
     };
 
+    const handleCreateIdentityManually = () => {
+        setIdentityError('');
+        setIdentityEditor({ mode: 'create', data: emptyIdentityData(), identity: null });
+    };
+
+    const handleEditIdentity = (identity: Identity) => {
+        setIdentityError('');
+        setIdentityEditor({ mode: 'edit', data: identityToEditable(identity), identity });
+    };
+
+    /**
+     * Optional convenience, not the way in: generation needs an endpoint
+     * configured in settings, so a failure opens the blank editor rather than
+     * leaving the user with nothing.
+     */
     const handleGenerateIdentity = async () => {
         setGeneratingIdentity(true);
+        setIdentityError('');
         const resp = await send<GeneratedIdentityData>({ type: 'GENERATE_IDENTITY' });
         setGeneratingIdentity(false);
         if (resp.success && resp.data) {
-            setIdentityEditor(resp.data);
+            setIdentityEditor({ mode: 'review', data: resp.data, identity: null });
+        } else {
+            setIdentityError(resp.error || 'Generation is unavailable — fill the identity in manually.');
+            setIdentityEditor({ mode: 'create', data: emptyIdentityData(), identity: null });
         }
     };
 
     const handleSaveIdentity = async (data: GeneratedIdentityData) => {
-        const resp = await send<Identity>({ type: 'CREATE_IDENTITY', payload: { data } });
-        setIdentityEditor(null);
-        if (resp.success) {
-            await loadIdentities();
+        const editor = identityEditor;
+        if (!editor) return;
+
+        const resp = editor.identity
+            ? await send<Identity>({
+                type: 'UPDATE_IDENTITY',
+                payload: { identity: { ...editor.identity, ...data, address: { ...editor.identity.address, ...data.address } } },
+            })
+            : await send<Identity>({ type: 'CREATE_IDENTITY', payload: { data } });
+
+        if (!resp.success) {
+            setIdentityError(resp.error || 'Could not save the identity');
+            return;
         }
+
+        setIdentityEditor(null);
+        setIdentityError('');
+        await loadIdentities();
+        // Keep the detail view in step with what was just saved.
+        if (editor.identity && resp.data) setSelectedIdentity(resp.data);
     };
 
     const handleDeleteIdentity = async (id: string) => {
@@ -205,15 +315,20 @@ export default function App() {
                             <p className="text-xs text-vw-console-text-secondary">Enter your PIN to decrypt locally</p>
                         </div>
                     </div>
-                    <input
-                        type="password"
-                        value={pin}
-                        onChange={(e) => setPin(e.target.value)}
-                        onKeyDown={(e) => e.key === 'Enter' && handleUnlock()}
-                        placeholder="••••"
-                        className="w-full px-4 py-3 bg-vw-console-surface border border-vw-console-border rounded-lg text-white font-mono text-lg focus:outline-none focus:border-vw-gold mb-3"
-                        autoFocus
-                    />
+                    <div className="relative mb-3">
+                        <input
+                            type="password"
+                            value={pin}
+                            onChange={(e) => { setPin(e.target.value); setError(''); }}
+                            onKeyDown={(e) => e.key === 'Enter' && handleUnlock()}
+                            placeholder="••••"
+                            className="w-full px-4 py-3 pr-11 bg-vw-console-surface border border-vw-console-border rounded-lg text-white font-mono text-lg focus:outline-none focus:border-vw-gold"
+                            autoFocus
+                        />
+                        {autoChecking && (
+                            <Loader2 className="w-4 h-4 text-vw-gold animate-spin absolute right-4 top-1/2 -translate-y-1/2" />
+                        )}
+                    </div>
                     {error && <p className="text-sm text-vw-signal-alert mb-3">{error}</p>}
                     <button
                         onClick={handleUnlock}
@@ -289,11 +404,19 @@ export default function App() {
                 <div className="px-3 py-3 border-t border-[#161320]/8">
                     <button
                         onClick={handleSync}
-                        className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-[#161320]/70 hover:bg-[#161320]/5 transition-colors"
+                        disabled={syncing}
+                        className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-[#161320]/70 hover:bg-[#161320]/5 transition-colors disabled:opacity-60"
                     >
-                        <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
-                        Sync
+                        <RefreshCw className={`w-4 h-4 ${syncing ? 'animate-spin' : ''}`} />
+                        <span className="flex-1 text-left">Sync</span>
+                        {!syncing && syncStatus?.state === 'ok' && (
+                            <Check className="w-3.5 h-3.5 text-vw-signal-online" />
+                        )}
+                        {!syncing && syncStatus?.state === 'error' && (
+                            <AlertCircle className="w-3.5 h-3.5 text-vw-signal-alert" />
+                        )}
                     </button>
+                    <SyncStatusLine status={syncStatus} syncing={syncing} />
                     <button
                         onClick={handleLock}
                         className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm text-[#161320]/70 hover:bg-[#161320]/5 transition-colors"
@@ -329,26 +452,54 @@ export default function App() {
                                         />
                                     </div>
                                     <button
+                                        onClick={handleCreateIdentityManually}
+                                        className="flex items-center gap-2 px-4 py-2 bg-vw-gold text-vw-console-bg rounded-lg text-sm font-medium hover:bg-[#C69431]"
+                                    >
+                                        <Plus className="w-4 h-4" />
+                                        {t('identityCreateManual')}
+                                    </button>
+                                    <button
                                         onClick={handleGenerateIdentity}
                                         disabled={generatingIdentity}
-                                        className="flex items-center gap-2 px-4 py-2 bg-vw-gold text-vw-console-bg rounded-lg text-sm font-medium hover:bg-[#C69431] disabled:opacity-50"
+                                        title="Requires a generation endpoint in Settings"
+                                        className="flex items-center gap-2 px-4 py-2 border border-vw-console-border text-vw-console-text-secondary rounded-lg text-sm font-medium hover:text-white hover:bg-vw-console-raised disabled:opacity-50"
                                     >
                                         {generatingIdentity ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
-                                        Generate Identity
+                                        Generate
                                     </button>
                                 </div>
                             </div>
 
-                            {identities.length === 0 && !generatingIdentity ? (
+                            {identityError && (
+                                <div className="flex items-start gap-2 mb-4 px-3 py-2 rounded-lg border border-vw-console-border bg-vw-console-surface text-xs text-vw-signal-warning">
+                                    <AlertCircle className="w-4 h-4 flex-shrink-0 mt-px" />
+                                    <span>{identityError}</span>
+                                </div>
+                            )}
+
+                            {dataLoading ? (
+                                <div className="text-center py-20">
+                                    <Loader2 className="w-8 h-8 text-vw-gold animate-spin mx-auto mb-3" />
+                                    <p className="text-sm text-vw-console-text-secondary">Decrypting vault…</p>
+                                </div>
+                            ) : identities.length === 0 && !generatingIdentity ? (
                                 <div className="text-center py-20">
                                     <Users className="w-12 h-12 text-vw-console-text-secondary/30 mx-auto mb-3" />
-                                    <p className="text-vw-console-text-secondary mb-4">No identities yet. Generate your first fictional persona.</p>
-                                    <button
-                                        onClick={handleGenerateIdentity}
-                                        className="inline-flex items-center gap-2 px-4 py-2 bg-vw-gold text-vw-console-bg rounded-lg text-sm font-medium hover:bg-[#C69431]"
-                                    >
-                                        <Sparkles className="w-4 h-4" /> Generate Identity
-                                    </button>
+                                    <p className="text-vw-console-text-secondary mb-4">No identities yet. Create one by hand, or generate one if you have an endpoint configured.</p>
+                                    <div className="flex items-center justify-center gap-3">
+                                        <button
+                                            onClick={handleCreateIdentityManually}
+                                            className="inline-flex items-center gap-2 px-4 py-2 bg-vw-gold text-vw-console-bg rounded-lg text-sm font-medium hover:bg-[#C69431]"
+                                        >
+                                            <Plus className="w-4 h-4" /> {t('identityCreateManual')}
+                                        </button>
+                                        <button
+                                            onClick={handleGenerateIdentity}
+                                            className="inline-flex items-center gap-2 px-4 py-2 border border-vw-console-border text-vw-console-text-secondary rounded-lg text-sm font-medium hover:text-white hover:bg-vw-console-raised"
+                                        >
+                                            <Sparkles className="w-4 h-4" /> Generate
+                                        </button>
+                                    </div>
                                 </div>
                             ) : (
                                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -370,13 +521,6 @@ export default function App() {
                                 </div>
                             )}
 
-                            {identityEditor && (
-                                <IdentityEditorModal
-                                    data={identityEditor}
-                                    onSave={handleSaveIdentity}
-                                    onCancel={() => setIdentityEditor(null)}
-                                />
-                            )}
                         </>
                     )}
 
@@ -388,10 +532,22 @@ export default function App() {
                             allItems={items}
                             onBack={() => setSelectedIdentity(null)}
                             onDelete={() => handleDeleteIdentity(selectedIdentity.id)}
+                            onEdit={() => handleEditIdentity(selectedIdentity)}
                             onEditItem={(item) => setEditingItem(item)}
                             onAssignItem={(itemId) => handleAssignItem(itemId, selectedIdentity.id)}
                             onUnassignItem={handleUnassignItem}
                             onCreateItem={() => setShowTypeSelector(true)}
+                        />
+                    )}
+
+                    {/* Rendered outside both branches so editing works from the
+                        list and from an open identity alike. */}
+                    {tab === 'identities' && identityEditor && (
+                        <IdentityEditorModal
+                            mode={identityEditor.mode}
+                            data={identityEditor.data}
+                            onSave={handleSaveIdentity}
+                            onCancel={() => { setIdentityEditor(null); setIdentityError(''); }}
                         />
                     )}
 
@@ -428,7 +584,12 @@ export default function App() {
                                 </div>
                             </div>
 
-                            {filteredItems.length === 0 ? (
+                            {dataLoading ? (
+                                <div className="text-center py-20">
+                                    <Loader2 className="w-8 h-8 text-vw-gold animate-spin mx-auto mb-3" />
+                                    <p className="text-sm text-vw-console-text-secondary">Decrypting vault…</p>
+                                </div>
+                            ) : filteredItems.length === 0 ? (
                                 <div className="text-center py-20">
                                     <Shield className="w-12 h-12 text-vw-console-text-secondary/30 mx-auto mb-3" />
                                     <p className="text-vw-console-text-secondary">No items yet. Create your first vault item.</p>
@@ -517,7 +678,7 @@ function ItemCard({ item, onClick }: { item: VaultItem; onClick: () => void }) {
                         {item.itemType === 'address' && `${(item.data as AddressItem).fullName}`}
                         {item.itemType === 'card' && `•••• ${(item.data as CardItem).cardNumber.slice(-4)}`}
                         {item.itemType === 'totp' && (item.data as TotpItem).issuer || (item.data as TotpItem).label}
-                        {item.itemType === 'passkey' && (item.data as PasskeyItem).rpId}
+                        {item.itemType === 'passkey' && ((item.data as PasskeyItem).userName || (item.data as PasskeyItem).rpId)}
                     </p>
                 </div>
                 <div className={`flex-shrink-0 ${config.color}`}>
@@ -690,13 +851,35 @@ function ItemEditor({ item, itemType, onSave, onCancel, onDelete, prefillUrl }: 
                     )}
 
                     {itemType === 'passkey' && (
-                        <>
-                            <div><label className={labelClass}>Relying Party ID</label><input className={inputClass} value={passkeyData.rpId} onChange={(e) => setPasskeyData({ ...passkeyData, rpId: e.target.value })} placeholder="example.com" /></div>
-                            <div><label className={labelClass}>Credential ID</label><input className={`${inputClass} font-mono`} value={passkeyData.credentialId} onChange={(e) => setPasskeyData({ ...passkeyData, credentialId: e.target.value })} /></div>
-                            <div><label className={labelClass}>Private Key</label><textarea className={`${inputClass} font-mono`} rows={3} value={passkeyData.privateKey} onChange={(e) => setPasskeyData({ ...passkeyData, privateKey: e.target.value })} /></div>
-                            <div><label className={labelClass}>User Handle</label><input className={inputClass} value={passkeyData.userHandle} onChange={(e) => setPasskeyData({ ...passkeyData, userHandle: e.target.value })} /></div>
-                            <div><label className={labelClass}>Notes</label><textarea className={inputClass} rows={2} value={passkeyData.notes ?? ''} onChange={(e) => setPasskeyData({ ...passkeyData, notes: e.target.value })} /></div>
-                        </>
+                        passkeyData.createdByAuthenticator ? (
+                            /* Created by the built-in authenticator. The key material is
+                               what the site verifies against, so it is shown read-only —
+                               editing any of it would silently break sign-in. */
+                            <>
+                                <div className="flex items-center gap-2 px-3 py-2 rounded-lg border border-vw-console-border bg-vw-console-surface text-xs text-vw-console-text-secondary">
+                                    <Fingerprint className="w-4 h-4 text-vw-violet flex-shrink-0" />
+                                    <span>Created by VaultWares on {passkeyData.createdAt ? new Date(passkeyData.createdAt).toLocaleDateString() : 'this device'}. Key material is read-only.</span>
+                                </div>
+                                <div><label className={labelClass}>Relying Party</label><input className={inputClass} value={passkeyData.rpName || passkeyData.rpId} readOnly /></div>
+                                <div><label className={labelClass}>Relying Party ID</label><input className={`${inputClass} font-mono`} value={passkeyData.rpId} readOnly /></div>
+                                <div><label className={labelClass}>Account</label><input className={inputClass} value={passkeyData.userDisplayName || passkeyData.userName || ''} readOnly /></div>
+                                <div><label className={labelClass}>Credential ID</label><input className={`${inputClass} font-mono`} value={passkeyData.credentialId} readOnly /></div>
+                                <div><label className={labelClass}>Algorithm</label><input className={inputClass} value={passkeyData.algorithm === -7 ? 'ES256 (ECDSA P-256)' : String(passkeyData.algorithm ?? '')} readOnly /></div>
+                                <div><label className={labelClass}>Notes</label><textarea className={inputClass} rows={2} value={passkeyData.notes ?? ''} onChange={(e) => setPasskeyData({ ...passkeyData, notes: e.target.value })} /></div>
+                            </>
+                        ) : (
+                            <>
+                                <div className="flex items-start gap-2 px-3 py-2 rounded-lg border border-vw-console-border bg-vw-console-surface text-xs text-vw-signal-warning">
+                                    <AlertCircle className="w-4 h-4 flex-shrink-0 mt-px" />
+                                    <span>Imported passkeys are stored but cannot be used to sign in — the authenticator only asserts with credentials it created.</span>
+                                </div>
+                                <div><label className={labelClass}>Relying Party ID</label><input className={inputClass} value={passkeyData.rpId} onChange={(e) => setPasskeyData({ ...passkeyData, rpId: e.target.value })} placeholder="example.com" /></div>
+                                <div><label className={labelClass}>Credential ID</label><input className={`${inputClass} font-mono`} value={passkeyData.credentialId} onChange={(e) => setPasskeyData({ ...passkeyData, credentialId: e.target.value })} /></div>
+                                <div><label className={labelClass}>Private Key</label><textarea className={`${inputClass} font-mono`} rows={3} value={passkeyData.privateKey} onChange={(e) => setPasskeyData({ ...passkeyData, privateKey: e.target.value })} /></div>
+                                <div><label className={labelClass}>User Handle</label><input className={inputClass} value={passkeyData.userHandle} onChange={(e) => setPasskeyData({ ...passkeyData, userHandle: e.target.value })} /></div>
+                                <div><label className={labelClass}>Notes</label><textarea className={inputClass} rows={2} value={passkeyData.notes ?? ''} onChange={(e) => setPasskeyData({ ...passkeyData, notes: e.target.value })} /></div>
+                            </>
+                        )
                     )}
 
                     <div className="flex items-center gap-2">
@@ -975,6 +1158,19 @@ function SettingsPanel({ settings, onSave }: { settings: VaultSettings | null; o
                     <input type="checkbox" checked={local.autoDetectEnabled} onChange={(e) => setLocal({ ...local, autoDetectEnabled: e.target.checked })} className="accent-vw-gold" />
                     Auto-detect login/signup forms
                 </label>
+                <label className="flex items-center gap-2 text-sm text-vw-console-text-secondary cursor-pointer">
+                    <input type="checkbox" checked={local.savePromptEnabled} onChange={(e) => setLocal({ ...local, savePromptEnabled: e.target.checked })} className="accent-vw-gold" />
+                    Offer to save logins after sign-in
+                </label>
+                <div>
+                    <label className="flex items-center gap-2 text-sm text-vw-console-text-secondary cursor-pointer">
+                        <input type="checkbox" checked={local.passkeysEnabled} onChange={(e) => setLocal({ ...local, passkeysEnabled: e.target.checked })} className="accent-vw-gold" />
+                        Handle passkeys in VaultWares
+                    </label>
+                    <p className="text-[11px] text-vw-console-text-secondary/60 mt-1 ml-6">
+                        Off hands every passkey prompt to your browser or security key instead.
+                    </p>
+                </div>
                 <button onClick={handleSave} className="w-full py-2.5 bg-vw-gold text-vw-console-bg rounded-lg font-medium hover:bg-[#C69431] flex items-center justify-center gap-2">
                     {saved ? <><Check className="w-4 h-4" /> Saved</> : 'Save Settings'}
                 </button>
@@ -1029,6 +1225,41 @@ function DevicesPanel() {
     );
 }
 
+function relativeTime(iso: string): string {
+    const seconds = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
+    if (seconds < 60) return 'just now';
+    const minutes = Math.round(seconds / 60);
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.round(minutes / 60);
+    if (hours < 24) return `${hours}h ago`;
+    return `${Math.round(hours / 24)}d ago`;
+}
+
+function SyncStatusLine({ status, syncing }: { status: SyncStatus | null; syncing: boolean }) {
+    let text: string;
+    let tone = 'text-[#161320]/45';
+
+    if (syncing) {
+        text = 'Syncing…';
+    } else if (status?.state === 'error') {
+        text = status.error ?? 'Sync failed';
+        tone = 'text-vw-signal-alert';
+    } else if (status?.lastSuccessAt) {
+        text = `Synced ${relativeTime(status.lastSuccessAt)}`;
+    } else {
+        text = 'Not synced yet';
+    }
+
+    return (
+        <div className="px-3 pb-1">
+            <p className={`text-[10px] ${tone}`}>{text}</p>
+            {/* Sync only covers vault items today — identities live on this
+                device alone. Saying so beats letting the user assume otherwise. */}
+            <p className="text-[10px] text-[#161320]/35">Items only — identities stay local</p>
+        </div>
+    );
+}
+
 function IdentityCard({ identity, itemCount, onClick }: { identity: Identity; itemCount: number; onClick: () => void }) {
     return (
         <div onClick={onClick} className="vw-card p-5 cursor-pointer hover:border-vw-gold/30 transition-colors group">
@@ -1058,28 +1289,73 @@ function IdentityCard({ identity, itemCount, onClick }: { identity: Identity; it
     );
 }
 
-function IdentityEditorModal({ data, onSave, onCancel }: { data: GeneratedIdentityData; onSave: (data: GeneratedIdentityData) => void; onCancel: () => void }) {
+function IdentityEditorModal({ mode, data, onSave, onCancel }: {
+    mode: IdentityEditorMode;
+    data: GeneratedIdentityData;
+    onSave: (data: GeneratedIdentityData) => void;
+    onCancel: () => void;
+}) {
     const [local, setLocal] = useState<GeneratedIdentityData>(data);
+    const [validationError, setValidationError] = useState('');
 
     const inputClass = "w-full px-3 py-2 bg-vw-console-surface border border-vw-console-border rounded-lg text-sm text-white focus:outline-none focus:border-vw-gold";
     const labelClass = "block text-xs font-medium text-vw-console-text-secondary mb-1.5";
+
+    const title = mode === 'review'
+        ? t('identityReviewTitle')
+        : mode === 'edit' ? t('identityEditTitle') : t('identityNewTitle');
+
+    const submit = () => {
+        if (!local.fullName.trim()) {
+            setValidationError(t('identityNameRequired'));
+            return;
+        }
+        setValidationError('');
+        // A record written by an older version — or returned by a generation
+        // endpoint that omitted the block — may have no address at all, so it
+        // is defaulted rather than destructured blind.
+        const address = local.address ?? emptyIdentityData().address;
+        // The address carries its own name field; keep it in step with the
+        // persona so autofill does not put two different names on one form.
+        onSave({
+            ...local,
+            address: {
+                ...address,
+                fullName: (address.fullName ?? '').trim() || local.fullName,
+                phone: address.phone || local.phone,
+            },
+        });
+    };
 
     return (
         <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50 p-4" onClick={onCancel}>
             <div className="vw-card p-6 max-w-lg w-full max-h-[85vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
                 <div className="flex items-center justify-between mb-6">
                     <div className="flex items-center gap-2">
-                        <Sparkles className="w-5 h-5 text-vw-gold" />
-                        <h2 className="text-lg font-semibold text-white">Review Generated Identity</h2>
+                        {mode === 'review' ? <Sparkles className="w-5 h-5 text-vw-gold" /> : <User className="w-5 h-5 text-vw-gold" />}
+                        <h2 className="text-lg font-semibold text-white">{title}</h2>
                     </div>
                     <button onClick={onCancel} className="text-vw-console-text-secondary hover:text-white"><X className="w-5 h-5" /></button>
                 </div>
+
+                {validationError && (
+                    <div className="flex items-center gap-2 mb-4 px-3 py-2 rounded-lg border border-vw-signal-alert/40 bg-vw-signal-alert/10 text-xs text-vw-signal-alert">
+                        <AlertCircle className="w-4 h-4 flex-shrink-0" />
+                        <span>{validationError}</span>
+                    </div>
+                )}
 
                 <div className="space-y-4">
                     <div className="grid grid-cols-2 gap-3">
                         <div>
                             <label className={labelClass}>Full Name</label>
-                            <input className={inputClass} value={local.fullName} onChange={(e) => setLocal({ ...local, fullName: e.target.value })} />
+                            <input
+                                className={inputClass}
+                                value={local.fullName}
+                                autoFocus
+                                placeholder="Jean Tremblay"
+                                onChange={(e) => setLocal({ ...local, fullName: e.target.value })}
+                            />
                         </div>
                         <div>
                             <label className={labelClass}>Gender</label>
@@ -1094,11 +1370,11 @@ function IdentityEditorModal({ data, onSave, onCancel }: { data: GeneratedIdenti
                     <div className="grid grid-cols-2 gap-3">
                         <div>
                             <label className={labelClass}>Birth Date</label>
-                            <input className={inputClass} value={local.birthDate} onChange={(e) => setLocal({ ...local, birthDate: e.target.value })} />
+                            <input type="date" className={inputClass} value={local.birthDate} onChange={(e) => setLocal({ ...local, birthDate: e.target.value })} />
                         </div>
                         <div>
                             <label className={labelClass}>Nationality</label>
-                            <input className={inputClass} value={local.nationality} onChange={(e) => setLocal({ ...local, nationality: e.target.value })} />
+                            <input className={inputClass} placeholder="Canada" value={local.nationality} onChange={(e) => setLocal({ ...local, nationality: e.target.value })} />
                         </div>
                     </div>
                     <div>
@@ -1133,8 +1409,8 @@ function IdentityEditorModal({ data, onSave, onCancel }: { data: GeneratedIdenti
 
                 <div className="flex items-center justify-end gap-3 mt-6">
                     <button onClick={onCancel} className="px-4 py-2 text-sm text-vw-console-text-secondary hover:text-white">Discard</button>
-                    <button onClick={() => onSave(local)} className="px-4 py-2 bg-vw-gold text-vw-console-bg rounded-lg text-sm font-medium hover:bg-[#C69431]">
-                        Save Identity
+                    <button onClick={submit} className="px-4 py-2 bg-vw-gold text-vw-console-bg rounded-lg text-sm font-medium hover:bg-[#C69431]">
+                        {t('identitySave')}
                     </button>
                 </div>
             </div>
@@ -1142,12 +1418,13 @@ function IdentityEditorModal({ data, onSave, onCancel }: { data: GeneratedIdenti
     );
 }
 
-function IdentityDetailView({ identity, items, allItems, onBack, onDelete, onEditItem, onAssignItem, onUnassignItem, onCreateItem }: {
+function IdentityDetailView({ identity, items, allItems, onBack, onDelete, onEdit, onEditItem, onAssignItem, onUnassignItem, onCreateItem }: {
     identity: Identity;
     items: VaultItem[];
     allItems: VaultItem[];
     onBack: () => void;
     onDelete: () => void;
+    onEdit: () => void;
     onEditItem: (item: VaultItem) => void;
     onAssignItem: (itemId: string) => void;
     onUnassignItem: (itemId: string) => void;
@@ -1177,9 +1454,14 @@ function IdentityDetailView({ identity, items, allItems, onBack, onDelete, onEdi
                     <p className="text-sm text-vw-console-text-secondary mt-1">{identity.gender} · {identity.birthDate} · {identity.nationality}</p>
                     <p className="text-sm text-vw-console-text-secondary/80 mt-2">{identity.bio}</p>
                 </div>
-                <button onClick={onDelete} className="text-vw-signal-alert/60 hover:text-vw-signal-alert text-sm flex items-center gap-1">
-                    <Trash2 className="w-4 h-4" /> Delete
-                </button>
+                <div className="flex items-center gap-4">
+                    <button onClick={onEdit} className="text-vw-console-text-secondary hover:text-white text-sm flex items-center gap-1">
+                        <Settings className="w-4 h-4" /> Edit
+                    </button>
+                    <button onClick={onDelete} className="text-vw-signal-alert/60 hover:text-vw-signal-alert text-sm flex items-center gap-1">
+                        <Trash2 className="w-4 h-4" /> Delete
+                    </button>
+                </div>
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-8">

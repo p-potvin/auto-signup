@@ -36,12 +36,31 @@ export interface TotpItem {
     algorithm: 'SHA1' | 'SHA256' | 'SHA512';
 }
 
+/**
+ * A WebAuthn credential the extension can actually assert with.
+ *
+ * The original five fields are kept under their old names so records created
+ * by the manual passkey editor before v2.1 still load. Everything the
+ * authenticator added is optional and defaulted on read.
+ *
+ * `privateKey` is base64url PKCS#8 (P-256) and `publicKey` base64url SPKI.
+ * Both live inside the encrypted envelope like any other item field.
+ */
 export interface PasskeyItem {
     rpId: string;
     credentialId: string;
     privateKey: string;
     userHandle: string;
     notes?: string;
+    rpName?: string;
+    publicKey?: string;
+    userName?: string;
+    userDisplayName?: string;
+    /** COSE algorithm identifier; -7 (ES256) is all this authenticator issues. */
+    algorithm?: number;
+    /** True for credentials created by this extension's authenticator. */
+    createdByAuthenticator?: boolean;
+    createdAt?: string;
 }
 
 export type VaultItemData = LoginItem | AddressItem | CardItem | TotpItem | PasskeyItem;
@@ -77,6 +96,13 @@ export interface VaultSettings {
     vaultSectionName: string;
     generationEndpointUrl: string;
     autoAssignItemsToIdentity: boolean;
+    /**
+     * When false, WebAuthn ceremonies are handed straight back to the browser
+     * so the user's platform authenticator or security key still works.
+     */
+    passkeysEnabled: boolean;
+    /** Offer to save a login after a form is submitted. */
+    savePromptEnabled: boolean;
     // Local vault-warden the extension syncs to, on this machine. Encrypted
     // envelopes are pushed here instead of a cloud API.
     syncServerUrl: string;
@@ -93,6 +119,8 @@ export const DEFAULT_SETTINGS: VaultSettings = {
     vaultSectionName: 'Vault',
     generationEndpointUrl: '',
     autoAssignItemsToIdentity: true,
+    passkeysEnabled: true,
+    savePromptEnabled: true,
     syncServerUrl: 'http://127.0.0.1:9444/v1',
     syncLocalToken: '',
 };

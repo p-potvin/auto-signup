@@ -2,7 +2,41 @@
 
 > A **VaultWares** project.
 
-Identity vault and auto-signup Chrome extension. Detects sign-up forms and fills them with generated identities and strong passwords.
+Identity vault, passkey authenticator, and autofill extension for Firefox 128+
+and Chrome. Detects login and sign-up forms, suggests vault entries, and acts as
+a WebAuthn authenticator so passkeys are held in the encrypted vault rather than
+in the browser profile.
+
+Filling a sign-up form is a suggestion you accept, not an automated flow — the
+extension never creates an account on your behalf.
+
+## Capabilities
+
+- **Passkeys.** Replaces `navigator.credentials` to create and assert real
+  WebAuthn credentials (ES256), with the private keys sealed in the vault. Every
+  ceremony needs explicit consent, and the browser or a security key is always
+  one click away.
+
+  Scope: modal registration and authentication ceremonies. Conditional mediation
+  (passkeys in the autofill dropdown), hybrid/cross-device transport, and
+  WebAuthn extensions are **not** implemented. The vault is local to one machine
+  — sync targets a `vault-warden` on the same host — so a passkey created here is
+  **not** available on your other devices. Design and open gaps:
+  `docs/passkeys.md`.
+- **Identities.** Personas are created and edited by hand; AI generation is an
+  optional convenience over the same editor and is never required.
+- **Autofill.** Detects credential forms across shadow roots and late-rendered
+  SPA views, scopes fills to one form, and offers to save what you submit.
+
+## Verification
+
+```bash
+npm run typecheck && npm run test:webauthn && npm run build
+```
+
+`test:webauthn` runs a relying party against the authenticator — it parses the
+attestation with an independent CBOR decoder and verifies 300 assertion
+signatures with WebCrypto.
 
 ## Program Documentation
 

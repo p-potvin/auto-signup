@@ -29,7 +29,11 @@ export async function deleteEncryptedItem(id: string): Promise<void> {
 
 export async function getSettings(): Promise<VaultSettings> {
     const result = await chrome.storage.local.get(SETTINGS_KEY) as Record<string, any>;
-    return (result[SETTINGS_KEY] as VaultSettings) ?? DEFAULT_SETTINGS;
+    const stored = result[SETTINGS_KEY] as Partial<VaultSettings> | undefined;
+    // Merged rather than returned as-is: a settings blob written by an older
+    // version has no key for a newly added setting, and a missing boolean would
+    // read as `false` and silently disable the feature it gates.
+    return { ...DEFAULT_SETTINGS, ...(stored ?? {}) };
 }
 
 export async function saveSettings(settings: VaultSettings): Promise<void> {

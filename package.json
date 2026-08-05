@@ -1,12 +1,14 @@
 {
   "name": "vaultwares-identity-manager",
-  "version": "2.0.0",
-  "description": "VaultWares Identity Manager — PQC zero-knowledge password & identity vault browser extension",
+  "version": "2.1.0",
+  "description": "VaultWares Identity Manager — PQC zero-knowledge password, passkey & identity vault browser extension",
   "private": true,
   "scripts": {
     "build": "webpack --mode production",
     "dev": "webpack --mode development --watch",
-    "clean": "rimraf dist"
+    "clean": "rimraf dist",
+    "typecheck": "tsc --noEmit",
+    "test:webauthn": "node test/webauthn-conformance.mjs"
   },
   "dependencies": {
     "@noble/ciphers": "^1.0.0",

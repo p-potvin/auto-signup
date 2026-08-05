@@ -1,7 +1,19 @@
 # Crypto status
 
 Current state of the vault's cryptography, what a security review found, and what
-is deliberately still open. Written 2026-07-15.
+is deliberately still open. Written 2026-07-15, updated 2026-08-05.
+
+## Passkey key material (added v2.1.0)
+
+WebAuthn credentials use ECDSA P-256 (COSE ES256) because that is what relying
+parties verify — it is fixed by the protocol and is not a choice the vault gets
+to make post-quantum. The classical P-256 key is only ever the *contents* of a
+vault item: it is sealed inside the same ML-KEM-768 envelope as everything else,
+so at rest it carries the vault's PQC protection. See `docs/passkeys.md`.
+
+Private keys are generated in the background service worker, exported once as
+PKCS#8, and immediately encrypted. They are never sent to a page — the injected
+page script only ever receives a finished signature.
 
 ## Key hierarchy (as implemented)
 

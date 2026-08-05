@@ -8,7 +8,9 @@ import { createVaultItem as apiCreateItem, updateVaultItem as apiUpdateItem, del
 import { pushChanges, pullChanges } from '../api/sync';
 import { enqueueCreate, enqueueUpdate, enqueueDelete, processQueue, fullSync, startAutoSync } from '../api/sync-queue';
 import { generateIdentity as generateIdentityApi } from '../api/generation';
-import type { VaultItem, EncryptedVaultItem, ItemType, VaultItemData, VaultItemMetadata, VaultSettings, RecoveryKit, Identity, GeneratedIdentityData } from '../types';
+import { prepareCeremony, performCreate, performGet, WebAuthnError, type PasskeyRecord, type VaultAccess } from '../webauthn/service';
+import type { SerializedCreationOptions, SerializedRequestOptions } from '../webauthn/types';
+import type { VaultItem, EncryptedVaultItem, ItemType, VaultItemData, VaultItemMetadata, VaultSettings, RecoveryKit, Identity, GeneratedIdentityData, PasskeyItem, LoginItem } from '../types';
 
 export type MessageType =
     | 'INIT_CHECK'
@@ -34,7 +36,18 @@ export type MessageType =
     | 'GENERATE_IDENTITY'
     | 'ASSIGN_ITEM_TO_IDENTITY'
     | 'UNASSIGN_ITEM_FROM_IDENTITY'
-    | 'UPDATE_ITEM_LAST_USED';
+    | 'UPDATE_ITEM_LAST_USED'
+    | 'WEBAUTHN_PREPARE'
+    | 'WEBAUTHN_CREATE'
+    | 'WEBAUTHN_GET'
+    | 'OPEN_VAULT_UNLOCK'
+    | 'GET_SYNC_STATUS'
+    | 'GET_PAGE_IDENTITIES'
+    | 'TOUCH_IDENTITY'
+    | 'QUEUE_SAVE_PROMPT'
+    | 'GET_PENDING_SAVE'
+    | 'CLEAR_PENDING_SAVE'
+    | 'SAVE_LOGIN_FROM_PAGE';
 
 export interface Message {
     type: MessageType;
@@ -45,6 +58,16 @@ export interface MessageResponse {
     success: boolean;
     data?: any;
     error?: string;
+    /** Set for WebAuthn failures so the page can throw the right DOMException. */
+    errorName?: string;
+    /**
+     * The vault was locked, so `data` is empty because nothing could be
+     * decrypted — not because there is nothing stored.
+     *
+     * Without this the UI cannot tell those two apart and renders its empty
+     * state, which looks exactly like the vault has been wiped.
+     */
+    locked?: boolean;
 }
 
 let lockTimer: ReturnType<typeof setTimeout> | null = null;
@@ -133,7 +156,7 @@ async function handleGetItems(): Promise<MessageResponse> {
 
         const masterKey = await getCachedMasterKey();
         if (!masterKey) {
-            return { success: false, error: 'Vault is locked' };
+            return { success: false, error: 'Vault is locked', locked: true };
         }
 
         const items: VaultItem[] = [];
@@ -250,14 +273,55 @@ async function handleDownloadRecoveryKit(payload: { kit: RecoveryKit }): Promise
     }
 }
 
+export interface SyncStatus {
+    state: 'idle' | 'syncing' | 'ok' | 'error';
+    lastAttemptAt: string | null;
+    lastSuccessAt: string | null;
+    pushed: number;
+    pulled: number;
+    error: string | null;
+}
+
+/**
+ * Sync ran silently every 60s with no way to tell whether it worked. Tracked
+ * here so the UI can say so — a vault that claims to sync and gives no feedback
+ * is indistinguishable from one that is quietly failing.
+ */
+let syncStatus: SyncStatus = {
+    state: 'idle',
+    lastAttemptAt: null,
+    lastSuccessAt: null,
+    pushed: 0,
+    pulled: 0,
+    error: null,
+};
+
 async function handleSync(): Promise<MessageResponse> {
+    syncStatus = { ...syncStatus, state: 'syncing', error: null, lastAttemptAt: new Date().toISOString() };
     try {
         const queueResult = await processQueue();
         const syncResult = await fullSync();
-        return { success: true, data: { ...syncResult, ...queueResult } };
+
+        syncStatus = {
+            ...syncStatus,
+            // fullSync swallows transport errors and reports ok:false rather
+            // than throwing, so a green tick here would be a lie without it.
+            state: syncResult.ok ? 'ok' : 'error',
+            lastSuccessAt: syncResult.ok ? new Date().toISOString() : syncStatus.lastSuccessAt,
+            pushed: syncResult.pushed,
+            pulled: syncResult.pulled,
+            error: syncResult.ok ? null : 'Could not reach the local vault-warden',
+        };
+
+        return { success: true, data: { ...syncResult, ...queueResult, status: syncStatus } };
     } catch (e) {
+        syncStatus = { ...syncStatus, state: 'error', error: (e as Error).message };
         return { success: false, error: (e as Error).message };
     }
+}
+
+function handleGetSyncStatus(): MessageResponse {
+    return { success: true, data: syncStatus };
 }
 
 async function handleGetPageMatches(payload: { url: string }): Promise<MessageResponse> {
@@ -266,10 +330,10 @@ async function handleGetPageMatches(payload: { url: string }): Promise<MessageRe
         const kemSecretKey = await getKemSecretKey();
         const sigKp = await getSigKeyPair();
 
-        if (!kemSecretKey || !sigKp) return { success: true, data: [] };
+        if (!kemSecretKey || !sigKp) return { success: true, data: [], locked: true };
 
         const masterKey = await getCachedMasterKey();
-        if (!masterKey) return { success: true, data: [] };
+        if (!masterKey) return { success: true, data: [], locked: true };
 
         const { normalizeDomain, domainMatches, urlMatches } = await import('../utils/domain');
         const pageDomain = normalizeDomain(payload.url);
@@ -314,6 +378,66 @@ async function handleGetPageMatches(payload: { url: string }): Promise<MessageRe
     }
 }
 
+/**
+ * Identities offered for autofill on a page, most relevant first.
+ *
+ * Identities are not domain-scoped the way logins are — a persona is meant to
+ * be reusable across sites. But one that already owns an item on this domain is
+ * the one you almost certainly want, so it sorts to the top; the rest follow by
+ * recency. Without this the content script never sees identities at all and a
+ * saved persona can never fill an address form.
+ */
+async function handleGetPageIdentities(payload: { url: string }): Promise<MessageResponse> {
+    try {
+        const identitiesResponse = await handleGetIdentities();
+        if (identitiesResponse.locked || !identitiesResponse.success) return identitiesResponse;
+
+        const identities = (identitiesResponse.data ?? []) as Identity[];
+        if (identities.length === 0) return { success: true, data: [] };
+
+        const matchesResponse = await handleGetPageMatches(payload);
+        const domainItems = (matchesResponse.data ?? []) as VaultItem[];
+        const domainIdentityIds = new Set(
+            domainItems.map(item => item.identityId).filter((id): id is string => !!id),
+        );
+
+        const ranked = [...identities].sort((a, b) => {
+            const aLinked = domainIdentityIds.has(a.id);
+            const bLinked = domainIdentityIds.has(b.id);
+            if (aLinked !== bLinked) return aLinked ? -1 : 1;
+            if (a.metadata.favorite !== b.metadata.favorite) return a.metadata.favorite ? -1 : 1;
+            return (b.lastUsedAt ?? '').localeCompare(a.lastUsedAt ?? '');
+        });
+
+        return {
+            success: true,
+            data: ranked.map(identity => ({
+                identity,
+                linkedToDomain: domainIdentityIds.has(identity.id),
+            })),
+        };
+    } catch (e) {
+        return { success: false, error: (e as Error).message };
+    }
+}
+
+/** Records that an identity was used, so it ranks higher next time. */
+async function handleTouchIdentity(payload: { id: string }): Promise<MessageResponse> {
+    try {
+        const response = await handleGetIdentities();
+        if (!response.success) return response;
+
+        const identity = (response.data as Identity[]).find(i => i.id === payload.id);
+        if (!identity) return { success: false, error: 'Identity not found' };
+
+        return handleUpdateIdentity({
+            identity: { ...identity, lastUsedAt: new Date().toISOString() },
+        });
+    } catch (e) {
+        return { success: false, error: (e as Error).message };
+    }
+}
+
 function createIdentityObject(data: GeneratedIdentityData, deviceId: string): Identity {
     const now = new Date().toISOString();
     return {
@@ -341,10 +465,10 @@ async function handleGetIdentities(): Promise<MessageResponse> {
         const encIdentities = await getEncryptedIdentities();
         const kemSecretKey = await getKemSecretKey();
         const sigKp = await getSigKeyPair();
-        if (!kemSecretKey || !sigKp) return { success: true, data: [] };
+        if (!kemSecretKey || !sigKp) return { success: true, data: [], locked: true };
 
         const masterKey = await getCachedMasterKey();
-        if (!masterKey) return { success: true, data: [] };
+        if (!masterKey) return { success: true, data: [], locked: true };
 
         const identities: Identity[] = [];
         for (const enc of encIdentities) {
@@ -499,7 +623,277 @@ async function handleUpdateItemLastUsed(payload: { itemId: string }): Promise<Me
     }
 }
 
-chrome.runtime.onMessage.addListener((message: Message, _sender, sendResponse) => {
+/* ------------------------------------------------------------- passkeys */
+
+/**
+ * Vault surface handed to the passkey service. Reuses the same envelope path as
+ * every other item, so passkeys are encrypted, synced, and locked identically.
+ */
+const passkeyVaultAccess: VaultAccess = {
+    isUnlocked: async () => (await getCachedMasterKey()) !== null,
+
+    listPasskeys: async (): Promise<PasskeyRecord[]> => {
+        const kemSecretKey = await getKemSecretKey();
+        const sigKp = await getSigKeyPair();
+        if (!kemSecretKey || !sigKp) return [];
+
+        const records: PasskeyRecord[] = [];
+        for (const enc of await getEncryptedItems()) {
+            if (enc.deletedAt || enc.envelope.itemType !== 'passkey') continue;
+            try {
+                const item = openEnvelope(enc, kemSecretKey, sigKp.publicKey);
+                records.push({ itemId: item.id, passkey: item.data as PasskeyItem });
+            } catch (e) {
+                console.error('Failed to decrypt passkey:', enc.id, e);
+            }
+        }
+        return records;
+    },
+
+    createItem: async (itemType, data, metadata) => {
+        const response = await handleCreateItem({ itemType, data, metadata });
+        if (!response.success) throw new Error(response.error ?? 'Could not store the passkey');
+        return response.data as VaultItem;
+    },
+
+    touchItem: async (itemId: string) => {
+        await handleUpdateItemLastUsed({ itemId });
+    },
+};
+
+function webAuthnFailure(e: unknown): MessageResponse {
+    if (e instanceof WebAuthnError) {
+        return { success: false, error: e.message, errorName: e.errorName };
+    }
+    return { success: false, error: (e as Error).message, errorName: 'NotAllowedError' };
+}
+
+async function handleWebAuthnPrepare(payload: {
+    kind: 'create' | 'get';
+    origin: string;
+    options: SerializedCreationOptions | SerializedRequestOptions;
+}): Promise<MessageResponse> {
+    try {
+        const settings = await getSettings();
+        const result = await prepareCeremony(
+            payload.kind,
+            payload.origin,
+            payload.options,
+            passkeyVaultAccess,
+            settings.passkeysEnabled,
+        );
+        return { success: true, data: result };
+    } catch (e) {
+        return webAuthnFailure(e);
+    }
+}
+
+async function handleWebAuthnCreate(payload: {
+    origin: string;
+    options: SerializedCreationOptions;
+}): Promise<MessageResponse> {
+    try {
+        const settings = await getSettings();
+        if (!settings.passkeysEnabled) {
+            return { success: false, error: 'Passkeys are disabled in VaultWares settings', errorName: 'NotAllowedError' };
+        }
+        const result = await performCreate(payload.origin, payload.options, passkeyVaultAccess);
+        return { success: true, data: result };
+    } catch (e) {
+        return webAuthnFailure(e);
+    }
+}
+
+async function handleWebAuthnGet(payload: {
+    origin: string;
+    options: SerializedRequestOptions;
+    credentialId?: string;
+}): Promise<MessageResponse> {
+    try {
+        const settings = await getSettings();
+        if (!settings.passkeysEnabled) {
+            return { success: false, error: 'Passkeys are disabled in VaultWares settings', errorName: 'NotAllowedError' };
+        }
+        const result = await performGet(
+            payload.origin,
+            payload.options,
+            passkeyVaultAccess,
+            payload.credentialId,
+        );
+        return { success: true, data: result };
+    } catch (e) {
+        return webAuthnFailure(e);
+    }
+}
+
+/* ---------------------------------------------------------- save prompt */
+
+interface PendingSave {
+    url: string;
+    username: string;
+    password: string;
+    decision: { status: 'new' | 'existing'; itemId?: string; samePassword?: boolean };
+    expiresAt: number;
+}
+
+/**
+ * Submitted credentials awaiting a save decision, keyed by tab.
+ *
+ * Kept in `chrome.storage.session`, not a module-level Map. A submit that
+ * navigates tears down the content script before the user can answer, so the
+ * pending save must survive one page load — and an MV3 service worker is
+ * evicted when idle, which would take a Map with it exactly during that gap.
+ * Session storage is memory-backed and cleared when the browser closes, so the
+ * plaintext password still never reaches disk.
+ */
+const PENDING_SAVE_KEY = 'vw_pending_saves';
+const PENDING_SAVE_TTL_MS = 2 * 60 * 1000;
+
+async function readPendingSaves(): Promise<Record<string, PendingSave>> {
+    const stored = await chrome.storage.session.get(PENDING_SAVE_KEY) as Record<string, any>;
+    const all = (stored[PENDING_SAVE_KEY] as Record<string, PendingSave>) ?? {};
+
+    const now = Date.now();
+    const live: Record<string, PendingSave> = {};
+    for (const [tabId, pending] of Object.entries(all)) {
+        if (pending.expiresAt > now) live[tabId] = pending;
+    }
+    return live;
+}
+
+async function writePendingSave(tabId: number, pending: PendingSave | null): Promise<void> {
+    const all = await readPendingSaves();
+    if (pending) all[String(tabId)] = pending;
+    else delete all[String(tabId)];
+    await chrome.storage.session.set({ [PENDING_SAVE_KEY]: all });
+}
+
+chrome.tabs.onRemoved.addListener(tabId => { void writePendingSave(tabId, null); });
+
+/**
+ * Reports whether a submitted credential is new, already stored, or a changed
+ * password for a known account — so the content script can ask the right
+ * question instead of offering to save a duplicate.
+ */
+async function handleFindLoginForSave(payload: {
+    url: string;
+    username: string;
+    password: string;
+}): Promise<MessageResponse> {
+    try {
+        if (!await passkeyVaultAccess.isUnlocked()) {
+            return { success: true, data: { status: 'locked' } };
+        }
+
+        const kemSecretKey = await getKemSecretKey();
+        const sigKp = await getSigKeyPair();
+        if (!kemSecretKey || !sigKp) return { success: true, data: { status: 'locked' } };
+
+        const { normalizeDomain } = await import('../utils/domain');
+        const domain = normalizeDomain(payload.url);
+        const username = payload.username.trim().toLowerCase();
+
+        for (const enc of await getEncryptedItems()) {
+            if (enc.deletedAt || enc.envelope.itemType !== 'login') continue;
+            if ((enc.envelope.metadata.domain || '') !== domain) continue;
+
+            const item = openEnvelope(enc, kemSecretKey, sigKp.publicKey);
+            const login = item.data as LoginItem;
+            if ((login.username ?? '').trim().toLowerCase() !== username) continue;
+
+            return {
+                success: true,
+                data: {
+                    status: 'existing',
+                    itemId: item.id,
+                    // Identical credentials mean there is nothing to ask about.
+                    samePassword: login.password === payload.password,
+                },
+            };
+        }
+
+        return { success: true, data: { status: 'new' } };
+    } catch (e) {
+        return { success: false, error: (e as Error).message };
+    }
+}
+
+async function handleQueueSavePrompt(
+    payload: { url: string; username: string; password: string },
+    tabId: number | undefined,
+): Promise<MessageResponse> {
+    const response = await handleFindLoginForSave(payload);
+    if (!response.success) return response;
+
+    const decision = response.data as PendingSave['decision'] | { status: 'locked' };
+
+    const actionable = decision.status === 'new'
+        || (decision.status === 'existing' && !(decision as PendingSave['decision']).samePassword);
+
+    if (tabId !== undefined && actionable) {
+        await writePendingSave(tabId, {
+            ...payload,
+            decision: decision as PendingSave['decision'],
+            expiresAt: Date.now() + PENDING_SAVE_TTL_MS,
+        });
+    }
+
+    return { success: true, data: decision };
+}
+
+async function handleGetPendingSave(tabId: number | undefined): Promise<MessageResponse> {
+    if (tabId === undefined) return { success: true, data: null };
+    const all = await readPendingSaves();
+    return { success: true, data: all[String(tabId)] ?? null };
+}
+
+async function handleSaveLoginFromPage(payload: {
+    url: string;
+    username: string;
+    password: string;
+    itemId?: string;
+}): Promise<MessageResponse> {
+    try {
+        const { normalizeDomain, getFullDomain } = await import('../utils/domain');
+        const domain = normalizeDomain(payload.url);
+
+        if (payload.itemId) {
+            const kemSecretKey = await getKemSecretKey();
+            const sigKp = await getSigKeyPair();
+            if (!kemSecretKey || !sigKp) return { success: false, error: 'Keychain not initialized' };
+
+            const enc = (await getEncryptedItems()).find(i => i.id === payload.itemId);
+            if (!enc) return { success: false, error: 'Item not found' };
+
+            const item = openEnvelope(enc, kemSecretKey, sigKp.publicKey);
+            const login = item.data as LoginItem;
+            return handleUpdateItem({
+                id: item.id,
+                data: { ...login, password: payload.password },
+                metadata: item.metadata,
+            });
+        }
+
+        return handleCreateItem({
+            itemType: 'login',
+            data: {
+                url: payload.url,
+                username: payload.username,
+                password: payload.password,
+            } satisfies LoginItem,
+            metadata: {
+                label: getFullDomain(payload.url) || domain,
+                domain,
+                tags: [],
+                favorite: false,
+            },
+        });
+    } catch (e) {
+        return { success: false, error: (e as Error).message };
+    }
+}
+
+chrome.runtime.onMessage.addListener((message: Message, sender, sendResponse) => {
     (async () => {
         let response: MessageResponse;
 
@@ -576,6 +970,41 @@ chrome.runtime.onMessage.addListener((message: Message, _sender, sendResponse) =
                 break;
             case 'UPDATE_ITEM_LAST_USED':
                 response = await handleUpdateItemLastUsed(message.payload);
+                break;
+            case 'WEBAUTHN_PREPARE':
+                response = await handleWebAuthnPrepare(message.payload);
+                break;
+            case 'WEBAUTHN_CREATE':
+                response = await handleWebAuthnCreate(message.payload);
+                break;
+            case 'WEBAUTHN_GET':
+                response = await handleWebAuthnGet(message.payload);
+                break;
+            case 'OPEN_VAULT_UNLOCK':
+                chrome.tabs.create({ url: chrome.runtime.getURL('vault.html?action=unlock') });
+                response = { success: true };
+                break;
+            case 'GET_SYNC_STATUS':
+                response = handleGetSyncStatus();
+                break;
+            case 'GET_PAGE_IDENTITIES':
+                response = await handleGetPageIdentities(message.payload);
+                break;
+            case 'TOUCH_IDENTITY':
+                response = await handleTouchIdentity(message.payload);
+                break;
+            case 'QUEUE_SAVE_PROMPT':
+                response = await handleQueueSavePrompt(message.payload, sender.tab?.id);
+                break;
+            case 'GET_PENDING_SAVE':
+                response = await handleGetPendingSave(sender.tab?.id);
+                break;
+            case 'CLEAR_PENDING_SAVE':
+                if (sender.tab?.id !== undefined) await writePendingSave(sender.tab.id, null);
+                response = { success: true };
+                break;
+            case 'SAVE_LOGIN_FROM_PAGE':
+                response = await handleSaveLoginFromPage(message.payload);
                 break;
             default:
                 response = { success: false, error: 'Unknown message type' };
