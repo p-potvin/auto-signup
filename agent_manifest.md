@@ -2,7 +2,7 @@
 
 **Project:** vaultwares-identity-manager  
 **Organization:** VaultWares  
-**Description:** Identity vault and auto-signup Chrome extension.
+**Description:** Identity vault, passkey authenticator, and autofill extension for Firefox 128+ and Chrome.
 
 ## Submodules
 

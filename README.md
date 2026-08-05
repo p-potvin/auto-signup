@@ -2,10 +2,13 @@
 
 > A **VaultWares** project.
 
-Identity vault, passkey authenticator, and auto-signup extension for Firefox 128+
+Identity vault, passkey authenticator, and autofill extension for Firefox 128+
 and Chrome. Detects login and sign-up forms, suggests vault entries, and acts as
 a WebAuthn authenticator so passkeys are held in the encrypted vault rather than
 in the browser profile.
+
+Filling a sign-up form is a suggestion you accept, not an automated flow — the
+extension never creates an account on your behalf.
 
 ## Capabilities
 
