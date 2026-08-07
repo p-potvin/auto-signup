@@ -2,14 +2,18 @@ import { initKeychain, wrapAndStoreMasterKey, unwrapMasterKey, setCachedMasterKe
 import { createEnvelope, openEnvelope, createVaultItem, updateVaultItemTimestamp } from '../crypto/envelope';
 import { generateRecoveryKit, downloadRecoveryKit } from '../crypto/recovery';
 import { getEncryptedItems, saveEncryptedItem, deleteEncryptedItem, replaceAllEncryptedItems, getSettings, saveSettings, getSyncCursor, setSyncCursor } from '../utils/storage';
-import { getEncryptedIdentities, saveEncryptedIdentity, deleteEncryptedIdentity, encryptIdentity, decryptIdentity } from '../utils/identity-storage';
+import { getEncryptedIdentities, saveEncryptedIdentity, deleteEncryptedIdentity, replaceAllEncryptedIdentities, encryptIdentity, decryptIdentity } from '../utils/identity-storage';
 import { register as apiRegister } from '../api/auth';
 import { createVaultItem as apiCreateItem, updateVaultItem as apiUpdateItem, deleteVaultItem as apiDeleteItem } from '../api/vault';
 import { pushChanges, pullChanges } from '../api/sync';
-import { enqueueCreate, enqueueUpdate, enqueueDelete, processQueue, fullSync, startAutoSync } from '../api/sync-queue';
+import { enqueueCreate, enqueueUpdate, enqueueDelete, processQueue, fullSync, startAutoSync, clearQueue } from '../api/sync-queue';
 import { generateIdentity as generateIdentityApi } from '../api/generation';
+import { fetchAccountKey, putAccountKey, getIdentityVaultId, fetchSealedKeychain, putSealedKeychain } from '../api/warden';
+import { buildEnrollment, validateMasterPassword, type EnrollmentState } from '../crypto/enrollment';
+import { openAccountKeyBlob, openPortableKeychain, fromPortableKeychain } from '../crypto/account-key';
 import { prepareCeremony, performCreate, performGet, WebAuthnError, type PasskeyRecord, type VaultAccess } from '../webauthn/service';
 import type { SerializedCreationOptions, SerializedRequestOptions } from '../webauthn/types';
+import { localStore } from '../platform/store';
 import type { VaultItem, EncryptedVaultItem, ItemType, VaultItemData, VaultItemMetadata, VaultSettings, RecoveryKit, Identity, GeneratedIdentityData, PasskeyItem, LoginItem } from '../types';
 
 export type MessageType =
@@ -41,13 +45,18 @@ export type MessageType =
     | 'WEBAUTHN_CREATE'
     | 'WEBAUTHN_GET'
     | 'OPEN_VAULT_UNLOCK'
+    | 'OPEN_VAULT'
     | 'GET_SYNC_STATUS'
     | 'GET_PAGE_IDENTITIES'
     | 'TOUCH_IDENTITY'
     | 'QUEUE_SAVE_PROMPT'
     | 'GET_PENDING_SAVE'
     | 'CLEAR_PENDING_SAVE'
-    | 'SAVE_LOGIN_FROM_PAGE';
+    | 'SAVE_LOGIN_FROM_PAGE'
+    | 'GET_ENROLLMENT_STATE'
+    | 'ENROLL_MASTER_PASSWORD'
+    | 'BOOTSTRAP_FROM_MASTER_PASSWORD'
+    | 'RESET_DEVICE';
 
 export interface Message {
     type: MessageType;
@@ -60,6 +69,8 @@ export interface MessageResponse {
     error?: string;
     /** Set for WebAuthn failures so the page can throw the right DOMException. */
     errorName?: string;
+    /** False when vault-warden could not be reached for this answer. */
+    reachable?: boolean;
     /**
      * The vault was locked, so `data` is empty because nothing could be
      * decrypted — not because there is nothing stored.
@@ -71,6 +82,57 @@ export interface MessageResponse {
 }
 
 let lockTimer: ReturnType<typeof setTimeout> | null = null;
+
+/* --------------------------------------------------------- vault tab */
+
+/**
+ * Opens the vault, reusing the tab if one is already open.
+ *
+ * Every entry point used to call `chrome.tabs.create`, so following a few
+ * "create item for this site" links left a row of identical vault tabs, each
+ * with its own unlock state and stale item list.
+ */
+async function openVaultTab(query = ''): Promise<void> {
+    const url = chrome.runtime.getURL(`vault.html${query}`);
+    const existing = await chrome.tabs.query({ url: chrome.runtime.getURL('vault.html') + '*' });
+
+    const tab = existing[0];
+    if (tab?.id !== undefined) {
+        await chrome.tabs.update(tab.id, { url, active: true });
+        if (tab.windowId !== undefined) {
+            await chrome.windows.update(tab.windowId, { focused: true });
+        }
+        return;
+    }
+    await chrome.tabs.create({ url });
+}
+
+/* ------------------------------------------------------- toolbar cue */
+
+let badgeTimer: ReturnType<typeof setTimeout> | null = null;
+
+/**
+ * Marks a successful save on the toolbar icon.
+ *
+ * Deliberately a small dot rather than a count or a word: it should read as
+ * "that worked" at a glance and not demand attention. It lingers well past a
+ * toast because the user is usually still on the page, mid-flow, and looks up
+ * only after finishing what they were doing.
+ */
+function flashSavedBadge(): void {
+    if (badgeTimer) clearTimeout(badgeTimer);
+
+    void chrome.action.setBadgeText({ text: '•' });
+    void chrome.action.setBadgeBackgroundColor({ color: '#D6A441' });
+    if (chrome.action.setBadgeTextColor) {
+        void chrome.action.setBadgeTextColor({ color: '#0b0813' });
+    }
+
+    badgeTimer = setTimeout(() => {
+        void chrome.action.setBadgeText({ text: '' });
+        badgeTimer = null;
+    }, 20_000);
+}
 
 function resetLockTimer(): void {
     if (lockTimer) clearTimeout(lockTimer);
@@ -144,6 +206,39 @@ async function handleGetUnlocked(): Promise<MessageResponse> {
     return { success: true, data: { unlocked: key !== null } };
 }
 
+/**
+ * Destroys every key this device holds, so onboarding starts from nothing.
+ *
+ * This is key *rotation*, which the vault otherwise had no way to do: the KEM
+ * and signing keypairs are generated once at onboarding and there was no path
+ * to replace them. A leaked recovery kit — which carries both secret keys under
+ * the master key, plus the master key under a four-character PIN — cannot be
+ * answered any other way, because every item is sealed to that KEM public key.
+ *
+ * Deliberately local-only and deliberately destructive. Items on the server are
+ * left alone: they are sealed to the old keypair and unreadable after this, so
+ * deleting them is a separate decision made with the vault still open, not a
+ * side effect of resetting a device. `confirm` must be the literal string
+ * below, because a mis-sent message must not be able to erase a vault.
+ */
+async function handleResetDevice(payload: { confirm?: string } | undefined): Promise<MessageResponse> {
+    if (payload?.confirm !== 'RESET') {
+        return { success: false, error: 'reset requires an explicit confirmation' };
+    }
+    try {
+        await clearKeychain();
+        await localStore.remove([ENROLLED_AT_KEY]);
+        await replaceAllEncryptedItems([]);
+        await replaceAllEncryptedIdentities([]);
+        await clearQueue();
+        await setSyncCursor('');
+        if (lockTimer) clearTimeout(lockTimer);
+        return { success: true };
+    } catch (e) {
+        return { success: false, error: (e as Error).message };
+    }
+}
+
 async function handleGetItems(): Promise<MessageResponse> {
     try {
         const encryptedItems = await getEncryptedItems();
@@ -190,6 +285,7 @@ async function handleCreateItem(payload: { itemType: ItemType; data: VaultItemDa
 
         await saveEncryptedItem(encrypted);
         await enqueueCreate(encrypted);
+        flashSavedBadge();
 
         return { success: true, data: item };
     } catch (e) {
@@ -224,6 +320,7 @@ async function handleUpdateItem(payload: { id: string; data: VaultItemData; meta
         const encrypted = createEnvelope(updated, kemPubKey, sigKp.secretKey, keychain.deviceId);
         await saveEncryptedItem(encrypted);
         await enqueueUpdate(encrypted);
+        flashSavedBadge();
 
         return { success: true, data: updated };
     } catch (e) {
@@ -335,44 +432,46 @@ async function handleGetPageMatches(payload: { url: string }): Promise<MessageRe
         const masterKey = await getCachedMasterKey();
         if (!masterKey) return { success: true, data: [], locked: true };
 
-        const { normalizeDomain, domainMatches, urlMatches } = await import('../utils/domain');
-        const pageDomain = normalizeDomain(payload.url);
+        const { matchStrength, MATCH_NONE } = await import('../utils/domain');
 
-        const exactMatches: VaultItem[] = [];
-        const fuzzyMatches: VaultItem[] = [];
+        // Ranked, not filtered: a credential saved for this exact subdomain
+        // should outrank one saved for a sibling of the same parent domain.
+        const scored: { item: VaultItem; strength: number }[] = [];
 
         for (const enc of items) {
             if (enc.deletedAt) continue;
-            const itemDomain = enc.envelope.metadata.domain || '';
-            const isExact = itemDomain === pageDomain;
-            const isFuzzy = !isExact && domainMatches(itemDomain, payload.url);
 
-            if (isExact || isFuzzy) {
+            let strength = matchStrength(enc.envelope.metadata.domain || '', payload.url);
+
+            // The stored URL can be more specific than metadata.domain, which
+            // older versions flattened to the registrable domain.
+            let item: VaultItem | null = null;
+            if (enc.envelope.itemType === 'login' || strength > MATCH_NONE) {
                 try {
-                    const item = openEnvelope(enc, kemSecretKey, sigKp.publicKey);
-                    if (isExact) exactMatches.push(item);
-                    else fuzzyMatches.push(item);
+                    item = openEnvelope(enc, kemSecretKey, sigKp.publicKey);
                 } catch (e) {
                     console.error('Failed to decrypt item:', enc.id, e);
+                    continue;
                 }
-                continue;
+            }
+            if (!item) continue;
+
+            if (item.itemType === 'login') {
+                const login = item.data as import('../types').LoginItem;
+                if (login.url) {
+                    strength = Math.max(strength, matchStrength(login.url, payload.url));
+                }
             }
 
-            if (enc.envelope.itemType === 'login') {
-                try {
-                    const item = openEnvelope(enc, kemSecretKey, sigKp.publicKey);
-                    const loginData = item.data as import('../types').LoginItem;
-                    if (loginData.url && urlMatches(loginData.url, payload.url)) {
-                        fuzzyMatches.push(item);
-                    }
-                } catch (e) {
-                    console.error('Failed to decrypt item:', enc.id, e);
-                }
-            }
+            if (strength > MATCH_NONE) scored.push({ item, strength });
         }
 
-        const allMatches = [...exactMatches, ...fuzzyMatches];
-        return { success: true, data: allMatches };
+        scored.sort((a, b) => {
+            if (a.strength !== b.strength) return b.strength - a.strength;
+            return (b.item.lastUsedAt ?? '').localeCompare(a.item.lastUsedAt ?? '');
+        });
+
+        return { success: true, data: scored.map(s => s.item) };
     } catch (e) {
         return { success: false, error: (e as Error).message };
     }
@@ -497,6 +596,7 @@ async function handleCreateIdentity(payload: { data: GeneratedIdentityData }): P
         const identity = createIdentityObject(payload.data, keychain.deviceId);
         const encrypted = encryptIdentity(identity, kemPubKey, sigKp.secretKey, keychain.deviceId);
         await saveEncryptedIdentity(encrypted);
+        flashSavedBadge();
 
         return { success: true, data: identity };
     } catch (e) {
@@ -893,6 +993,117 @@ async function handleSaveLoginFromPage(payload: {
     }
 }
 
+/* ------------------------------------------------------- enrollment */
+
+const ENROLLED_AT_KEY = 'vw_enrolled_at';
+
+/**
+ * What this device can do about multi-device right now.
+ *
+ * Reported rather than inferred in the UI because three of the four states look
+ * identical from the extension's own storage — the difference is whether the
+ * server already holds an account key, which only a round trip can answer.
+ */
+async function handleGetEnrollmentState(): Promise<MessageResponse> {
+    if (!await isInitialized()) {
+        return { success: true, data: { status: 'uninitialised' } satisfies EnrollmentState };
+    }
+
+    const stored = await localStore.get(ENROLLED_AT_KEY);
+    const enrolledAt = stored[ENROLLED_AT_KEY] as string | undefined;
+
+    let remoteKey = null;
+    let reachable = true;
+    try {
+        remoteKey = await fetchAccountKey();
+    } catch {
+        reachable = false;
+    }
+
+    if (enrolledAt && remoteKey) {
+        return { success: true, data: { status: 'enrolled', enrolledAt } satisfies EnrollmentState, reachable };
+    }
+    if (remoteKey) {
+        return { success: true, data: { status: 'remote-available' } satisfies EnrollmentState, reachable };
+    }
+    return { success: true, data: { status: 'local-only' } satisfies EnrollmentState, reachable };
+}
+
+/**
+ * Sets a master password on a vault that currently has only a local PIN.
+ *
+ * Requires the vault to be unlocked, because the master key it wraps only
+ * exists in memory while it is. Items are untouched: the password wraps the
+ * master key, and the master key is what items are sealed under.
+ */
+async function handleEnrollMasterPassword(payload: { password: string; confirmation: string }): Promise<MessageResponse> {
+    try {
+        const check = validateMasterPassword(payload.password, payload.confirmation);
+        if (!check.ok) return { success: false, error: check.reason };
+
+        const masterKey = await getCachedMasterKey();
+        if (!masterKey) return { success: false, error: 'Unlock the vault before setting a master password', locked: true };
+
+        const keychain = await getKeychain();
+        if (!keychain) return { success: false, error: 'Keychain not initialised' };
+
+        // Throws if the blobs do not round-trip, before anything is uploaded.
+        const bundle = buildEnrollment(masterKey, keychain, payload.password);
+
+        const vaultId = await getIdentityVaultId();
+        await putAccountKey(bundle.accountKey);
+        await putSealedKeychain(vaultId, bundle.sealedKeychain);
+
+        const enrolledAt = new Date().toISOString();
+        await localStore.set({ [ENROLLED_AT_KEY]: enrolledAt });
+        flashSavedBadge();
+
+        return { success: true, data: { status: 'enrolled', enrolledAt } satisfies EnrollmentState };
+    } catch (e) {
+        return { success: false, error: (e as Error).message };
+    }
+}
+
+/**
+ * Brings a device online from the master password alone.
+ *
+ * This is the path a phone takes. Nothing local is written until the keychain
+ * has been decrypted and parsed, so a wrong password or an unreachable server
+ * leaves the device exactly as it was.
+ */
+async function handleBootstrapFromMasterPassword(payload: { password: string; pin?: string }): Promise<MessageResponse> {
+    try {
+        const accountKey = await fetchAccountKey();
+        if (!accountKey) return { success: false, error: 'This account has no master password enrolled yet' };
+
+        const masterKey = openAccountKeyBlob(accountKey, payload.password);
+        if (!masterKey) return { success: false, error: 'Incorrect master password' };
+
+        const vaultId = await getIdentityVaultId();
+        const sealed = await fetchSealedKeychain(vaultId);
+        if (!sealed) return { success: false, error: 'No keychain found on the server for this account' };
+
+        const portable = openPortableKeychain(sealed, masterKey);
+        const deviceId = (await getKeychain())?.deviceId ?? crypto.randomUUID();
+        const state = fromPortableKeychain(portable, deviceId);
+
+        await localStore.set({ vw_keychain: state });
+        await setCachedMasterKey(masterKey);
+
+        // A local PIN is optional here; without one the master password is
+        // required on every unlock.
+        if (payload.pin) {
+            await wrapAndStoreMasterKey(masterKey, payload.pin);
+        }
+        await localStore.set({ [ENROLLED_AT_KEY]: new Date().toISOString() });
+        resetLockTimer();
+
+        return { success: true, data: { deviceId } };
+    } catch (e) {
+        return { success: false, error: (e as Error).message };
+    }
+}
+
 chrome.runtime.onMessage.addListener((message: Message, sender, sendResponse) => {
     (async () => {
         let response: MessageResponse;
@@ -944,7 +1155,11 @@ chrome.runtime.onMessage.addListener((message: Message, sender, sendResponse) =>
                 response = await handleGetPageMatches(message.payload);
                 break;
             case 'OPEN_POPUP_CREATE':
-                chrome.tabs.create({ url: chrome.runtime.getURL('vault.html?action=create&url=' + encodeURIComponent(message.payload?.url || '')) });
+                await openVaultTab('?action=create&url=' + encodeURIComponent(message.payload?.url || ''));
+                response = { success: true };
+                break;
+            case 'OPEN_VAULT':
+                await openVaultTab(message.payload?.query ?? '');
                 response = { success: true };
                 break;
             case 'GET_IDENTITIES':
@@ -981,7 +1196,7 @@ chrome.runtime.onMessage.addListener((message: Message, sender, sendResponse) =>
                 response = await handleWebAuthnGet(message.payload);
                 break;
             case 'OPEN_VAULT_UNLOCK':
-                chrome.tabs.create({ url: chrome.runtime.getURL('vault.html?action=unlock') });
+                await openVaultTab('?action=unlock');
                 response = { success: true };
                 break;
             case 'GET_SYNC_STATUS':
@@ -1002,6 +1217,18 @@ chrome.runtime.onMessage.addListener((message: Message, sender, sendResponse) =>
             case 'CLEAR_PENDING_SAVE':
                 if (sender.tab?.id !== undefined) await writePendingSave(sender.tab.id, null);
                 response = { success: true };
+                break;
+            case 'GET_ENROLLMENT_STATE':
+                response = await handleGetEnrollmentState();
+                break;
+            case 'ENROLL_MASTER_PASSWORD':
+                response = await handleEnrollMasterPassword(message.payload);
+                break;
+            case 'RESET_DEVICE':
+                response = await handleResetDevice(message.payload);
+                break;
+            case 'BOOTSTRAP_FROM_MASTER_PASSWORD':
+                response = await handleBootstrapFromMasterPassword(message.payload);
                 break;
             case 'SAVE_LOGIN_FROM_PAGE':
                 response = await handleSaveLoginFromPage(message.payload);

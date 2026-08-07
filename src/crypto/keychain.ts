@@ -2,6 +2,7 @@ import { generateKemKeyPair, generateSigKeyPair, toBase64, fromBase64 } from './
 import { generateSymmetricKey, encrypt, decrypt } from './symmetric';
 import { deriveKeyFromPin, generateSalt, saltToBase64, saltFromBase64 } from './kdf';
 import type { KeychainState, EncBlob } from '../types';
+import { localStore, sessionStore } from '../platform/store';
 
 /**
  * Key hierarchy:
@@ -10,9 +11,9 @@ import type { KeychainState, EncBlob } from '../types';
  *     master key --decrypts--> account KEM + signing secret keys
  *     account KEM secret --opens--> vault item envelopes
  *
- * Only public keys and ciphertext are ever written to chrome.storage.local, so
- * reading extension storage does not disclose the vault. Secret keys exist in
- * cleartext only in memory, and only while unlocked.
+ * Only public keys and ciphertext are ever written to local storage, so reading
+ * it — extension storage or the PWA's IndexedDB — does not disclose the vault.
+ * Secret keys exist in cleartext only in memory, and only while unlocked.
  */
 
 const STORAGE_KEY = 'vw_keychain';
@@ -44,7 +45,7 @@ export async function initKeychain(): Promise<{
         deviceId: null,
     };
 
-    await chrome.storage.local.set({ [STORAGE_KEY]: state });
+    await localStore.set({ [STORAGE_KEY]: state });
     return {
         kemPublicKey: state.kemPublicKey!,
         sigPublicKey: state.sigPublicKey!,
@@ -57,14 +58,14 @@ export async function wrapAndStoreMasterKey(masterKey: Uint8Array, pin: string):
     const derivedKey = deriveKeyFromPin(pin, salt);
     const { ciphertext, nonce } = encrypt(masterKey, derivedKey);
 
-    await chrome.storage.local.set({
+    await localStore.set({
         [WRAPPED_MASTER_KEY_KEY]: { ciphertext: toBase64(ciphertext), nonce: toBase64(nonce) },
         [SALT_KEY]: saltToBase64(salt),
     });
 }
 
 export async function unwrapMasterKey(pin: string): Promise<Uint8Array | null> {
-    const result = await chrome.storage.local.get([WRAPPED_MASTER_KEY_KEY, SALT_KEY]) as Record<string, any>;
+    const result = await localStore.get([WRAPPED_MASTER_KEY_KEY, SALT_KEY]) as Record<string, any>;
     const wrapped = result[WRAPPED_MASTER_KEY_KEY] as EncBlob | undefined;
     const saltB64 = result[SALT_KEY] as string | undefined;
     if (!wrapped || !saltB64) return null;
@@ -78,7 +79,7 @@ export async function unwrapMasterKey(pin: string): Promise<Uint8Array | null> {
 }
 
 export async function getKeychain(): Promise<KeychainState | null> {
-    const result = await chrome.storage.local.get(STORAGE_KEY) as Record<string, any>;
+    const result = await localStore.get(STORAGE_KEY) as Record<string, any>;
     return (result[STORAGE_KEY] as KeychainState) ?? null;
 }
 
@@ -86,7 +87,7 @@ export async function setDeviceId(deviceId: string): Promise<void> {
     const state = await getKeychain();
     if (state) {
         state.deviceId = deviceId;
-        await chrome.storage.local.set({ [STORAGE_KEY]: state });
+        await localStore.set({ [STORAGE_KEY]: state });
     }
 }
 
@@ -127,7 +128,7 @@ export async function getKemPublicKey(): Promise<Uint8Array | null> {
 }
 
 export async function clearKeychain(): Promise<void> {
-    await chrome.storage.local.remove([STORAGE_KEY, WRAPPED_MASTER_KEY_KEY, SALT_KEY]);
+    await localStore.remove([STORAGE_KEY, WRAPPED_MASTER_KEY_KEY, SALT_KEY]);
     await setCachedMasterKey(null);
 }
 
@@ -143,14 +144,15 @@ export async function setCachedMasterKey(key: Uint8Array | null): Promise<void> 
     cachedMasterKey = key;
     if (key) {
         try {
-            // storage.session is in-memory and cleared when the browser closes.
-            await chrome.storage.session.set({ [SESSION_KEY]: toBase64(key) });
+            // The session area is in-memory on both platforms: chrome.storage.session
+            // in the extension, a plain Map in the PWA. Never disk.
+            await sessionStore.set({ [SESSION_KEY]: toBase64(key) });
         } catch {
-            // chrome.storage.session may not be available in all contexts
+            // the session area may not be available in every context
         }
     } else {
         try {
-            await chrome.storage.session.remove(SESSION_KEY);
+            await sessionStore.remove(SESSION_KEY);
         } catch {
             // ignore
         }
@@ -160,7 +162,7 @@ export async function setCachedMasterKey(key: Uint8Array | null): Promise<void> 
 export async function getCachedMasterKey(): Promise<Uint8Array | null> {
     if (cachedMasterKey) return cachedMasterKey;
     try {
-        const result = await chrome.storage.session.get(SESSION_KEY) as Record<string, any>;
+        const result = await sessionStore.get(SESSION_KEY) as Record<string, any>;
         const stored = result[SESSION_KEY] as string | undefined;
         if (stored) {
             cachedMasterKey = fromBase64(stored);

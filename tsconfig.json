@@ -16,5 +16,6 @@
         "forceConsistentCasingInFileNames": true
     },
     "include": ["src/**/*"],
-    "exclude": ["node_modules", "dist", "src-legacy"]
+    // The service worker has its own config — see tsconfig.sw.json.
+    "exclude": ["node_modules", "dist", "src-legacy", "src/mobile/service-worker.ts"]
 }

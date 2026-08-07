@@ -1,6 +1,7 @@
 import type { Identity, EncryptedVaultItem } from '../types';
 import { encrypt, decrypt } from '../crypto/symmetric';
 import { encapsulate, decapsulate, sign, verify, toBase64, fromBase64, canonicalJSON } from '../crypto/pqc';
+import { localStore } from '../platform/store';
 
 const IDENTITIES_KEY = 'vw_identities';
 const ENVELOPE_VERSION = 2;
@@ -19,7 +20,7 @@ function identitySignaturePayload(env: {
 }
 
 export async function getEncryptedIdentities(): Promise<EncryptedVaultItem[]> {
-    const result = await chrome.storage.local.get(IDENTITIES_KEY) as Record<string, any>;
+    const result = await localStore.get(IDENTITIES_KEY) as Record<string, any>;
     return (result[IDENTITIES_KEY] as EncryptedVaultItem[]) ?? [];
 }
 
@@ -31,17 +32,17 @@ export async function saveEncryptedIdentity(enc: EncryptedVaultItem): Promise<vo
     } else {
         items.push(enc);
     }
-    await chrome.storage.local.set({ [IDENTITIES_KEY]: items });
+    await localStore.set({ [IDENTITIES_KEY]: items });
 }
 
 export async function deleteEncryptedIdentity(id: string): Promise<void> {
     const items = await getEncryptedIdentities();
     const filtered = items.filter(i => i.id !== id);
-    await chrome.storage.local.set({ [IDENTITIES_KEY]: filtered });
+    await localStore.set({ [IDENTITIES_KEY]: filtered });
 }
 
 export async function replaceAllEncryptedIdentities(items: EncryptedVaultItem[]): Promise<void> {
-    await chrome.storage.local.set({ [IDENTITIES_KEY]: items });
+    await localStore.set({ [IDENTITIES_KEY]: items });
 }
 
 export function encryptIdentity(

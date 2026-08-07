@@ -1,14 +1,21 @@
 {
   "name": "vaultwares-identity-manager",
   "version": "2.1.0",
-  "description": "VaultWares Identity Manager — PQC zero-knowledge password, passkey & identity vault browser extension",
+  "description": "VaultWares Identity Manager \u2014 PQC zero-knowledge password, passkey & identity vault browser extension",
   "private": true,
   "scripts": {
     "build": "webpack --mode production",
+    "build:pwa": "rimraf dist-pwa && webpack --config webpack.pwa.config.js",
     "dev": "webpack --mode development --watch",
-    "clean": "rimraf dist",
-    "typecheck": "tsc --noEmit",
-    "test:webauthn": "node test/webauthn-conformance.mjs"
+    "dev:pwa": "rimraf dist-pwa && webpack --config webpack.pwa.config.js --mode development --watch",
+    "clean": "rimraf dist dist-pwa",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.sw.json",
+    "test:webauthn": "node test/webauthn-conformance.mjs",
+    "test:import": "node test/import-parsers.mjs",
+    "test:domain": "node test/domain-matching.mjs",
+    "test": "npm run typecheck && npm run test:domain && npm run test:import && npm run test:portability && npm run test:webauthn",
+    "test:portability": "node test/account-portability.mjs",
+    "test:warden-live": "node test/warden-live.mjs"
   },
   "dependencies": {
     "@noble/ciphers": "^1.0.0",

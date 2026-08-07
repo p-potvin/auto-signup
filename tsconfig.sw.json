@@ -1,0 +1,14 @@
+{
+    // lib.dom and lib.webworker both declare `self`, with different types, so a
+    // service worker cannot be compiled under the app's config. This is the
+    // standard split rather than a workaround for something specific here.
+    "extends": "./tsconfig.json",
+    "compilerOptions": {
+        "lib": ["ES2020", "WebWorker"],
+        "types": [],
+        "noEmit": false
+    },
+    "include": ["src/mobile/service-worker.ts"],
+    // `exclude` is inherited, and the base config excludes this very file.
+    "exclude": ["node_modules", "dist", "dist-pwa", "src-legacy"]
+}

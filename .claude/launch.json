@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "pwa",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["scripts/serve-pwa.mjs", "5199"],
+      "port": 5199
+    }
+  ]
+}

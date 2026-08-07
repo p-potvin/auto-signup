@@ -55,28 +55,47 @@ Each of these was individually fatal or security-defeating:
 Envelope v2 and the new keychain layout both changed formats. Existing installs
 must re-run setup; nothing of value is lost because old items were undecryptable.
 
-## Shelved: multi-device key provisioning
+## Multi-device: unblocked (2026-08-05)
 
-Vault sync is **local-only**: the extension syncs to a `vault-warden` running on
-the same machine (`127.0.0.1:9444`), and each person runs their own. There is no
-shared server between devices, so a second device cannot reach another device's
-items at all — provisioning it a key would unlock nothing.
+This section previously said multi-device was shelved pending "a tailnet-shared
+vault-warden". That premise was wrong: `vault-warden` already provides Tailscale
+`whois` identity binding, per-user client-encrypted vaults, and
+`PUT/GET /v1/account/key` — a password-wrapped portable user key.
 
-This blocks the ROADMAP goal of "the same encrypted vault across browser,
-desktop, iOS, and Android".
+The extension's `masterKey` is structurally the same thing as that user key: 32
+random bytes wrapping the real key material. The only reason it was not portable
+is that its wrapped form lived in `chrome.storage.local`. Moving that one blob
+to `/v1/account/key` makes any device with the master password able to open the
+vault, with **no change to the item envelopes and no loss of ML-KEM**.
 
-**Intended path:** put users on their own tailnet and point their devices at one
-shared `vault-warden` over it, rather than loopback. Once devices share a sync
-target, multi-device provisioning becomes real work:
+See `docs/program/adrs/ADR-004-portable-account-key.md` for the decision and
+`src/crypto/account-key.ts` for the implementation. `npm run test:portability`
+proves a device built only from the password and the server's blobs opens an
+item sealed by another device.
 
-- an account-level vault key, KEM-encrypted to each approved device's device key
-  at approval time, so a new device can decapsulate and read existing items
-- the existing device model (`src/api/devices.ts`, register/approve/promote) is
-  **dormant, not dead** — it was built for the cloud API and would be reused here.
-  Do not delete it.
+Still true, and still open:
 
-Note the recovery kit restores *keys*, not *items*: a new machine's vault-warden
-database starts empty, so moving machines also needs an item export/restore.
+- The default `syncServerUrl` is `127.0.0.1:9444`. Multi-device requires
+  pointing it at the tailnet vault-warden.
+- **Existing installs have a PIN, not a master password.** Enrollment and
+  migration are not written yet; until they are, nothing actually moves.
+- The device model (`src/api/devices.ts`, register/approve/promote) is
+  **dormant, not dead**. It remains the right mechanism for approving a device
+  *without* sharing the password. Do not delete it.
+- The recovery kit restores *keys*, not *items*, and does not yet carry the
+  account-key blob.
+
+## Superseded: the PIN as the only secret
+
+A numeric PIN behind Argon2id was acceptable while the wrapped master key never
+left the machine. Once that blob is served to anything on the tailnet, a
+ten-thousand-candidate keyspace falls to offline grinding regardless of the work
+factor.
+
+ADR-004 therefore introduces a master password with a 12-character minimum for
+the server-side blob, and demotes the PIN to a local-only convenience unwrapping
+a device-held copy. The PIN must never again be the only thing protecting
+material that leaves the device.
 
 ## Still open (lower severity)
 

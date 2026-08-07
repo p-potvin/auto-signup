@@ -16,9 +16,10 @@ import {
     type DetectedField,
     type FieldRole,
 } from './detect';
-import { showMenu, closeMenu, isMenuOpen } from './menu';
+import { showMenu, closeMenu, isMenuOpen, isAnchorAlive } from './menu';
 import { showSavePrompt } from './save-prompt';
 import { t } from '../i18n/strings';
+import { loginIdentifier } from '../types';
 import type { VaultItem, LoginItem, CardItem, AddressItem, PasskeyItem, VaultSettings, Identity } from '../types';
 
 interface PageIdentity {
@@ -65,9 +66,13 @@ function fillDataForItem(item: VaultItem): Partial<Record<FieldRole, string>> {
     switch (item.itemType) {
         case 'login': {
             const login = item.data as LoginItem;
+            // A site may label its single identifier field either way, so each
+            // role falls back to whichever value exists.
+            const email = login.email || (login.username?.includes('@') ? login.username : '');
+            const username = login.username || login.email || '';
             return {
-                username: login.username || '',
-                email: login.username?.includes('@') ? login.username : '',
+                username,
+                email: email || username,
                 password: login.password || '',
                 newPassword: login.password || '',
                 totp: login.totpSecret || '',
@@ -128,7 +133,7 @@ function fillDataForIdentity(identity: Identity): Partial<Record<FieldRole, stri
 
 function subtitleFor(item: VaultItem): string {
     switch (item.itemType) {
-        case 'login': return (item.data as LoginItem).username || '';
+        case 'login': return loginIdentifier(item.data as LoginItem);
         case 'card': return `•••• ${(item.data as CardItem).cardNumber.slice(-4)}`;
         case 'address': return (item.data as AddressItem).city || '';
         case 'passkey': return (item.data as PasskeyItem).userName || (item.data as PasskeyItem).rpId;
@@ -195,6 +200,26 @@ async function openMenuFor(field: DetectedField): Promise<void> {
 
     const locked = response.locked || identityResponse.locked;
 
+    /*
+     * A generated password, offered where a new one is actually being set.
+     * Without this the only way to get one was to open the popup, generate,
+     * copy, and paste back — at which point most people just type something
+     * they already use.
+     */
+    const wantsNewPassword = form.fields.some(f => f.role === 'newPassword' || f.role === 'passwordConfirm')
+        || form.kind === 'signup'
+        || form.kind === 'changePassword';
+
+    const generateEntry = wantsNewPassword && !locked
+        ? [{
+            id: 'generate-password',
+            label: t('menuGeneratePassword'),
+            sublabel: t('menuGeneratePasswordHint'),
+            badge: t('menuGenerateBadge'),
+            onChoose: () => { void fillGeneratedPassword(form); },
+        }]
+        : [];
+
     showMenu({
         anchor: field.element,
         header: form.kind === 'signup' ? t('menuSignupHeader') : t('menuLoginsHeader'),
@@ -205,13 +230,42 @@ async function openMenuFor(field: DetectedField): Promise<void> {
         // Personas first on a sign-up form: filling the persona is the step that
         // comes before choosing a login there.
         entries: form.kind === 'signup'
-            ? [...identityEntries, ...itemEntries]
-            : [...itemEntries, ...identityEntries],
+            ? [...generateEntry, ...identityEntries, ...itemEntries]
+            : [...itemEntries, ...identityEntries, ...generateEntry],
         footerLabel: t('menuCreateForSite'),
         onFooter: () => {
             void send('OPEN_POPUP_CREATE', { url: window.location.href });
         },
     });
+}
+
+/**
+ * Fills every password box in the form with one freshly generated value, using
+ * the preset configured in settings so the page agrees with the popup and the
+ * vault generator.
+ *
+ * Confirm boxes get the same value — a mismatched confirmation is the most
+ * common way a generated password fails to take.
+ */
+async function fillGeneratedPassword(form: DetectedForm): Promise<void> {
+    const { generateFromPreset, PRESETS } = await import('../utils/password-generator');
+    const preset = PRESETS.find(p => p.id === settings?.defaultGeneratorPreset) ?? PRESETS[0];
+    const password = await generateFromPreset(preset);
+
+    fillForm(form, {
+        password,
+        newPassword: password,
+        passwordConfirm: password,
+    });
+
+    // The site may reject it and the user will want to try again by hand, so
+    // put it on the clipboard rather than making them re-generate.
+    try {
+        await navigator.clipboard.writeText(password);
+    } catch {
+        // Clipboard needs a user gesture on some sites; the fill already
+        // happened, so this is not worth surfacing.
+    }
 }
 
 /* ------------------------------------------------------------ save prompt */
@@ -220,7 +274,8 @@ function readCredentials(form: DetectedForm): { username: string; password: stri
     const password = form.fields.find(f => f.role === 'password' || f.role === 'newPassword');
     if (!password?.element.value) return null;
 
-    const identifier = form.fields.find(f => f.role === 'username' || f.role === 'email');
+    const identifier = form.fields.find(f => f.role === 'email')
+        ?? form.fields.find(f => f.role === 'username');
     return {
         username: identifier?.element.value ?? '',
         password: password.element.value,
@@ -385,11 +440,10 @@ function rescan(): void {
     forms = detectForms();
     for (const form of forms) wireForm(form);
 
-    // Close a menu whose field has been removed or hidden by a re-render.
-    if (isMenuOpen()) {
-        const active = document.activeElement;
-        if (!(active instanceof HTMLInputElement) || !isVisible(active)) closeMenu();
-    }
+    // Close only when the field the menu belongs to is genuinely gone. Keying
+    // this off document.activeElement closed the menu whenever a re-render
+    // briefly moved focus, which on a framework-driven page is immediately.
+    if (isMenuOpen() && !isAnchorAlive()) closeMenu();
 }
 
 function scheduleRescan(): void {

@@ -1,5 +1,15 @@
 node_modules/
 dist/
+dist-pwa/
 *.log
 .env
 .env.local
+.vw-test-build/
+.vw-test-build-live/
+
+# Recovery kits carry the account signing and KEM secret keys (encrypted under
+# the master key) and the master key itself wrapped under a PIN. A PIN is four
+# characters at minimum, which is hours of offline Argon2id — so a kit in a repo
+# is the vault. One was committed here on 2026-08-07; never again.
+.access/
+*.vwrecovery

@@ -12,6 +12,11 @@ implemented yet (conditional mediation, hybrid transport, extensions):
 Form detection, what gets offered for autofill, and how the save prompt survives
 a navigation: `docs/autofill.md`.
 
+Mobile (PWA, iOS first) — read before starting that work:
+`docs/handoff-pwa-ios.md`. It records why native iOS is ruled out, and the
+blocker that production still runs the legacy vault-warden build without the
+endpoints enrollment depends on.
+
 Known gaps from the v2.1.0 work:
 
 - New user-facing strings go through `src/i18n/strings.ts` (EN + QC). The UI
