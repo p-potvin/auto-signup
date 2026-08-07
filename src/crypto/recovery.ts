@@ -3,6 +3,7 @@ import { encrypt, decrypt } from './symmetric';
 import { generateSalt, saltToBase64, saltFromBase64, deriveKeyFromPin } from './kdf';
 import { getKeychain, getCachedMasterKey } from './keychain';
 import type { RecoveryKit, EncBlob } from '../types';
+import { localStore } from '../platform/store';
 
 /**
  * A recovery kit restores the *account* keys onto a new device or profile.
@@ -82,13 +83,13 @@ export async function restoreFromRecoveryKit(kit: RecoveryKit, pin: string): Pro
         sigSecretKeyEnc: kit.sigSecretKeyEnc as EncBlob,
         deviceId: null,
     };
-    await chrome.storage.local.set({ vw_keychain: state });
+    await localStore.set({ vw_keychain: state });
 
     // Re-wrap the master key under the same PIN for normal unlock on this device.
     const salt = generateSalt();
     const derived = deriveKeyFromPin(pin, salt);
     const wrapped = encrypt(masterKey, derived);
-    await chrome.storage.local.set({
+    await localStore.set({
         vw_wrapped_master_key: { ciphertext: toBase64(wrapped.ciphertext), nonce: toBase64(wrapped.nonce) },
         vw_pin_salt: saltToBase64(salt),
     });

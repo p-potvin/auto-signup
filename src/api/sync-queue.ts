@@ -1,6 +1,7 @@
 import { getEncryptedItems, getSyncCursor, setSyncCursor, replaceAllEncryptedItems } from '../utils/storage';
 import { pushChanges, pullChanges } from '../api/sync';
 import type { EncryptedVaultItem } from '../types';
+import { localStore } from '../platform/store';
 
 const QUEUE_KEY = 'vw_sync_queue';
 
@@ -14,12 +15,12 @@ interface QueueEntry {
 }
 
 async function getQueue(): Promise<QueueEntry[]> {
-    const result = await chrome.storage.local.get(QUEUE_KEY) as Record<string, any>;
+    const result = await localStore.get(QUEUE_KEY);
     return (result[QUEUE_KEY] as QueueEntry[]) ?? [];
 }
 
 async function saveQueue(queue: QueueEntry[]): Promise<void> {
-    await chrome.storage.local.set({ [QUEUE_KEY]: queue });
+    await localStore.set({ [QUEUE_KEY]: queue });
 }
 
 export async function enqueueCreate(item: EncryptedVaultItem): Promise<void> {

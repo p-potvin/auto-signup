@@ -1,9 +1,9 @@
 /**
  * The portable half of the key hierarchy.
  *
- * Today the wrapped master key and its salt live in `chrome.storage.local`, so
- * they exist on exactly one machine and no second device can ever open the
- * vault. This module moves that material into the shape `vault-warden` already
+ * Before this, the wrapped master key and its salt lived only in local device
+ * storage, so they existed on exactly one machine and no second device could
+ * ever open the vault. This module moves that material into the shape `vault-warden` already
  * defines at `PUT/GET /v1/account/key`, which is what makes a phone possible.
  *
  *     master password --Argon2id(salt)--> password key

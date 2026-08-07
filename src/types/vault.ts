@@ -117,9 +117,15 @@ export interface VaultSettings {
     passkeysEnabled: boolean;
     /** Offer to save a login after a form is submitted. */
     savePromptEnabled: boolean;
-    // Local vault-warden the extension syncs to, on this machine. Encrypted
-    // envelopes are pushed here instead of a cloud API.
+    // The vault-warden this account syncs to, tailnet-only. Encrypted envelopes
+    // are pushed here instead of to a cloud API.
     syncServerUrl: string;
+    /**
+     * Machine-automation token for a vault-warden running on this machine.
+     *
+     * Blank for a normal install: the tailnet is the authentication. Only sent
+     * to a loopback `syncServerUrl` (see `api/local-client.ts`).
+     */
     syncLocalToken: string;
 }
 
@@ -135,6 +141,9 @@ export const DEFAULT_SETTINGS: VaultSettings = {
     autoAssignItemsToIdentity: true,
     passkeysEnabled: true,
     savePromptEnabled: true,
-    syncServerUrl: 'http://127.0.0.1:9444/v1',
+    // greencloud over the tailnet. Nothing runs on 127.0.0.1 on a workstation,
+    // and an always-on host is what lets the phone reach the vault when this
+    // machine is asleep.
+    syncServerUrl: 'https://warden.vaultwares.ca/v1',
     syncLocalToken: '',
 };

@@ -12,7 +12,8 @@
     "test:import": "node test/import-parsers.mjs",
     "test:domain": "node test/domain-matching.mjs",
     "test": "npm run typecheck && npm run test:domain && npm run test:import && npm run test:portability && npm run test:webauthn",
-    "test:portability": "node test/account-portability.mjs"
+    "test:portability": "node test/account-portability.mjs",
+    "test:warden-live": "node test/warden-live.mjs"
   },
   "dependencies": {
     "@noble/ciphers": "^1.0.0",
