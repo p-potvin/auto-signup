@@ -1,123 +1,172 @@
 # Handoff: mobile vault (PWA), iOS first
 
-Written 2026-08-07, at the end of the session that built master-password
-enrollment. Read this before starting mobile work — several things that look
-decided are not, and one thing that looks working is not deployed.
+Rewritten 2026-08-07, after the session that built and deployed the PWA shell.
+The original version of this file listed a blocker and a six-step plan; steps
+1–4 are done and the blocker turned out to be two blockers, one of which was
+not visible from anything the previous session had run.
 
-## The decision already made, and why
+## Where it stands
 
-**Native iOS is off the table.** No Mac, no Xcode, and no intent to pay for the
-Apple developer programme. That rules out both a native app and a Safari Web
-Extension, since Xcode is mandatory to build and sign either. Do not re-propose
-them.
+**The PWA is live at `https://warden.vaultwares.ca/`, tailnet-only.** It shows
+the unlock screen and correctly reports that nothing is enrolled yet. Nothing
+else is needed to open it on the phone except Tailscale being connected.
 
-The consequence to internalise: **`ASCredentialProviderExtension` is what makes
-a password manager feel native on iOS** — QuickType bar, in-app autofill, and
-since iOS 17 passkeys system-wide. A PWA gets **none** of that. Copy-paste is
-the ceiling. Say so plainly rather than implying parity.
+| Step | State |
+|---|---|
+| 1. Deploy current vault-warden | done — `f33c221` on greencloud |
+| 2. Verify enrollment | done — `npm run test:warden-live`, 18/18 against the live service |
+| 3. Storage seam | done — `src/platform/store.ts` |
+| 4. PWA shell (unlock, list, search, copy) | done — deployed, verified in a browser |
+| 5. Face-ID unlock via WebAuthn RP | not started |
+| 6. Editing, then offline | not started |
 
-What a PWA *can* do that is worth having:
+## Do this before putting real data in the vault
 
-- Read and search the vault on the phone.
-- Unlock with Face ID via WebAuthn — the PWA acts as a *relying party* here,
-  which is unrelated to the authenticator work in `src/webauthn/` and is the one
-  place iOS biometrics are available to us.
-- Work offline once installed, with a service worker.
+**Rotate the keychain.** Commit `4220810` pushed
+`.access/vaultwares-recovery-kit-2026-08-05.vwrecovery` to this repo while it
+was public. A kit carries the ML-KEM-768 and ML-DSA-65 secret keys (encrypted
+under the master key) and the master key wrapped under the device PIN, which
+`onboarding/App.tsx` allows to be four characters — a few CPU-hours of Argon2id
+at 64 MiB. Assume it was fetched.
 
-## The blocker nobody has hit yet
+Nothing was decryptable: the vault had no items and no account key enrolled. The
+cost is forward-looking, and there are two halves to it:
 
-`src/api/warden.ts` calls `/v1/account/key` and `/v1/vaults/{id}/items`.
-**Those endpoints do not exist in production.** Measured 2026-08-07 over SSH:
-`/opt/vault-warden` on greencloud is the legacy 377-line build, not a git
-checkout, with only `secrets` and `audit_log` tables — no `users`, `vaults` or
-`items`. Enrollment will 404 against the live service.
+- Items sealed under that same KEM keypair later would be readable by anyone who
+  cracked the PIN, retroactively.
+- The **signing** secret key is in the kit too, so its holder can forge
+  envelopes that verify against the old `sigPublicKey`.
 
-So the first mobile task is not mobile at all:
+A fresh keychain retires both. The file is untracked and `.gitignore`d now, but
+the blob is still reachable in this branch's history — rotation is what makes it
+worthless, not its removal.
 
-1. Deploy the current `vault-warden` repo to greencloud, replacing the legacy
-   build. Check `vault-warden` PR #2 first — it adds a fail-fast database probe,
-   without which a misconfigured DSN is a 30-second hang and an opaque
-   `PoolTimeout`.
-2. Prove enrollment browser-to-browser before involving a phone. If two Firefox
-   profiles cannot share a vault, a PWA will not either, and debugging it on a
-   phone is far worse.
+## What the previous handoff got wrong
 
-Only then does mobile become a real task.
+The blocker it named was real: the deployed `/opt/vault-warden` was the legacy
+377-line build with no `users`, `vaults` or `items` tables. That is fixed.
 
-## What is already built and portable
+What it missed is that fixing it would not have been enough.
 
-Enrollment is done and tested (`npm run test:portability`, 28/28), including a
-device bootstrapped purely from the enrollment bundle opening an item sealed by
-the original. The model:
+**vault-warden scoped accounts to the Tailscale *node*, not the user.**
+`get_actor` upserted `users` on `node.StableID`. Measured on greencloud:
 
+| device | node StableID | UserProfile.ID |
+|---|---|---|
+| `clopeux-desktop` | `nHWBUgRYDH11CNTRL` | `4862949105728501` |
+| `clopeux-iphone` | `nSmv7Q2CZF11CNTRL` | `4862949105728501` |
+
+Same person, two accounts, two identity vaults. Enrollment would have reported
+success on the desktop and the phone would have opened an empty vault with no
+account key to unwrap — a failure that only appears on the second device.
+
+**And the local-token branch fired behind nginx.** It tested
+`request.client.host == "127.0.0.1"`, which is true for *every* proxied request,
+so any tailnet caller holding `VW_SECRETS_LOCAL_TOKEN` got the synthetic local
+user's vaults. The extension sends that header from its settings, so it landed
+on a third account, distinct from both devices.
+
+Both fixed in vault-warden `#3`; `tests/test_identity_scope.py` pins them.
+
+## What is deployed, and how to redeploy
+
+Both services deploy through `vw-webhookd` on a push to main, same as everything
+else on greencloud. Either script is safe to run by hand, in which case it takes
+the tip of `origin/main`:
+
+```bash
+ssh -i ~/.ssh/id_ed25519 root@100.73.93.84 /var/www/deploy-scripts/deploy-vault-warden.sh
 ```
-master password --Argon2id--> password key --unwraps--> master key   (server: /v1/account/key)
-master key --opens--> sealed portable keychain                        (server: identity vault item)
-keychain --> ML-KEM secret --opens--> item envelopes
+
+```bash
+ssh -i ~/.ssh/id_ed25519 root@100.73.93.84 /var/www/deploy-scripts/deploy-vaultwares-pwa.sh
 ```
 
-The PIN is unchanged and stays device-local; it wraps a local copy of the master
-key for quick unlock. The phone has no PIN and starts from the master password.
+- `ops/deploy/deploy-vault-warden.sh` → `/opt/vault-warden`, keeps `venv/`,
+  `compose/` and `postgres-data/`, restores the previous tree if `/health` does
+  not answer in 30s. Deployed sha in `/opt/vault-warden/.deployed-sha`.
+- `ops/deploy/deploy-vaultwares-pwa.sh` → `/var/www/warden.vaultwares.ca`,
+  refuses to publish an incomplete bundle.
+- `ops/nginx/warden.vaultwares.ca.conf` — nginx serves `/`, vault-warden keeps
+  `/v1`, `/health`, `/docs`, `/openapi.json`.
 
-**PQC is not a problem here.** `@noble/post-quantum` is pure JavaScript and runs
-in iOS Safari. The reason ML-KEM looked like a blocker earlier was the *native*
-path, where CryptoKit has no ML-KEM and you would be binding liboqs into Swift.
-Going PWA removes that entirely — do not "simplify" the crypto to symmetric-only
-on mobile's account. That would be a real posture regression for no gain.
+**`p-potvin/vault-warden` has no GitHub webhook**, so its pushes do not
+auto-deploy yet. The receiver side is done. Creating the hook returned `403
+Resource not accessible by integration` — the GitHub App installation lacks
+`admin:repo_hook`. This repo already has its hook (id `628183962`), so the PWA
+auto-deploys once this branch merges.
 
-## Where the PWA should be served from
+## Things that will bite the next person
 
-vault-warden already serves over the tailnet behind `warden.vaultwares.ca`
-(nginx on greencloud to `127.0.0.1:9444`). `clopeux-iphone` (`100.75.112.67`) is
-already on the tailnet, so the transport exists today.
+- **nginx includes `sites-enabled/*`, not `*.conf`.** A backup left beside the
+  original loads as a second server block for the same name. nginx only warns.
+  Backups belong in `/etc/nginx/backups/`.
+- **The old nginx config sent `Access-Control-Allow-Origin: *`.** That was a
+  real hole, not dead weight: vault-warden authenticates by source address, so
+  any page a tailnet device loaded could read `/v1/vaults` — or write
+  `/v1/account/key` — with the browser supplying the identity. Removed. Do not
+  reinstate `snippets/cors.conf` here; the PWA is same-origin and the extension
+  declares `<all_urls>` in `host_permissions`.
+- **`webpack.pwa.config.js` exports an array, and webpack runs those in
+  parallel.** Neither config may set `output.clean`; the app build would delete
+  the service worker the much faster SW build had already written. `build:pwa`
+  wipes `dist-pwa` once, up front.
+- **The web session area is memory only**, by design — it holds the unwrapped
+  master key, and `sessionStorage` would put that on disk. A reload therefore
+  costs another Argon2id pass. That is the argument for step 5, not a bug.
+- **`test/warden-live.mjs` writes to a live vault** and refuses to run when an
+  account key is enrolled. It is out of `npm test` on purpose.
 
-Serving the PWA from vault-warden itself is the least-moving-parts option: same
-origin as the API, no CORS, no second deployment. Tailnet-only, which is the
-right default for a vault.
+## Still true, and still the point
 
-Note the earlier deployment discussion concluded vault-warden would run on
-`clopeux-desktop`. **It is already on greencloud and running there** — the
-desktop plan predated checking. Greencloud is the better host anyway: always on,
-so the phone does not lose the vault when the desktop sleeps.
+**Native iOS is off the table.** No Mac, no Xcode, no developer programme. That
+rules out a native app and a Safari Web Extension both. Do not re-propose them.
 
-## Reusable as-is
+The consequence: `ASCredentialProviderExtension` is what makes a password
+manager feel native on iOS — QuickType, in-app autofill, system-wide passkeys.
+A PWA gets **none** of it. Copy-paste is the ceiling. `mobile/clipboard.ts`
+makes copying fast and takes the secret back after 30s, and says so out loud
+when Safari refuses the clear (a timer-driven clipboard write is not a user
+gesture, so it can be denied).
 
-`src/crypto/`, `src/utils/domain.ts`, `src/utils/import.ts`, `src/types/` have no
-`chrome.*` dependency. `src/utils/storage.ts` does, and is the seam — a PWA needs
-an IndexedDB implementation behind the same interface.
+**PQC is not a problem.** `@noble/post-quantum` is pure JavaScript and the
+bundle runs ML-KEM-768 in the browser today — verified, six items decrypted.
+Do not "simplify" the crypto to symmetric-only on mobile's account.
 
-The vault UI is React and already responsive-ish, but it was built for a 1280px
-tab. Expect real layout work, not a media query.
+`navigator.credentials.get` on iOS goes to the *system* authenticator. That is
+correct and wanted for step 5, and it is unrelated to `src/webauthn/`, which is
+this extension's own authenticator and cannot be reached from the phone.
 
-## iOS-specific traps
+**Storage eviction is the reason the install prompt exists.** Safari clears
+IndexedDB after ~7 days for sites not on the Home Screen. Local state is a
+cache that can always be rebuilt from the server with the master password —
+keep it that way, and never let the phone be the only copy of anything.
 
-- **Storage eviction.** Safari clears IndexedDB/localStorage after ~7 days of
-  non-use for sites that are not installed to the Home Screen. For a cached
-  vault that means silent data loss. Two mitigations: prompt to install, and
-  treat local state as a cache that can always be rebuilt from the server with
-  the master password. Never let the phone be the only copy of anything.
-- **No autofill.** Nothing can be done about this. Design the copy flow to be
-  genuinely fast — one tap to copy, clipboard cleared on a timer.
-- **`navigator.credentials.get` on iOS** goes to the system authenticator. That
-  is correct and wanted for Face-ID unlock; it is *not* the extension's
-  authenticator and cannot be made to be.
-- **Service worker + crypto.** Do not cache decrypted material in the service
-  worker's cache storage. It outlives the tab.
+## Where things live
 
-## Suggested order
+- `src/mobile/session.ts` — bootstrap, unlock, search. Every interesting failure
+  is here, deliberately outside the React tree.
+- `src/mobile/App.tsx` — the UI. Read-only.
+- `src/mobile/service-worker.ts` — offline shell. **No vault data in Cache
+  Storage**; `/v1/` is network-only and uncached, which is verified.
+- `src/platform/store.ts` — the seam. `chrome.storage` in the extension,
+  IndexedDB on the web, memory for the session area on both.
+- `scripts/serve-pwa.mjs` — serves `dist-pwa` on loopback for desktop testing.
+  `http://localhost` is a secure context, so service workers and the clipboard
+  behave as they will on the phone.
 
-1. Deploy current vault-warden (see blocker above).
-2. Verify enrollment browser-to-browser.
-3. Extract the storage seam so `src/crypto` and `src/utils` build outside the
-   extension.
-4. PWA shell: unlock, list, search, copy. No editing at first.
-5. Face-ID unlock via WebAuthn RP.
-6. Editing, then offline.
+## Suggested order from here
+
+1. Rotate the keychain (above), then enrol a master password from the extension.
+2. Open `https://warden.vaultwares.ca/` on the phone and unlock.
+3. Face-ID unlock via WebAuthn RP — the PWA as relying party, wrapping the master
+   key under a credential so a reload is not another Argon2id pass.
+4. Editing, then offline.
 
 ## Still open, unrelated to mobile
 
 - Export (CSV / password-protected zip, selection screen, subdomain-flattening
   compatibility mode for re-import into Proton).
-- Item sync still targets `api/sync.ts` rather than vault-warden's item API.
-- `vaultwares-docs` PR #27 corrects several stale architecture claims; if it has
-  not merged, the inventory pages still misdescribe what is deployed.
+- `vaultwares-docs` PR #27 corrects stale architecture claims; if it has not
+  merged, the inventory pages still misdescribe what is deployed. They now also
+  predate this deployment.
