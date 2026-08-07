@@ -23,6 +23,16 @@ import { generateTotpCode, getTotpRemainingSeconds } from '../utils/totp';
 import { probeAccount, deriveMasterKey, openVault, searchItems, type AccountState, type UnlockedVault } from './session';
 import { copySecret, cancelPendingClear, type ClipboardState } from './clipboard';
 
+/**
+ * How long the vault may sit in the background before it locks.
+ *
+ * Two minutes is sized to the paste round-trip — copy here, switch, paste,
+ * come back — with room for a password field that wants a second attempt. The
+ * clipboard clears at 30s regardless, so the exposed secret is already gone
+ * well before this fires.
+ */
+const BACKGROUND_LOCK_MS = 120_000;
+
 /* ------------------------------------------------------------------ chrome */
 
 function StatusBanner({ state, onDismiss }: { state: ClipboardState; onDismiss: () => void }) {
@@ -386,13 +396,37 @@ export default function App() {
         setClipboard({ status: 'idle' });
     }, []);
 
-    // Locking when the tab goes away is the closest thing to an auto-lock a PWA
-    // has: iOS reclaims backgrounded tabs on its own schedule, so leaning on a
-    // timer would be theatre.
+    /**
+     * Lock after a spell in the background, not the instant it starts.
+     *
+     * Locking on `hidden` was wrong, and wrong in a way that broke the app's
+     * only job: with no autofill on iOS, using a password *means* copying it and
+     * switching to another app to paste. That fires `visibilitychange`, so every
+     * single use ended in a locked vault and another Argon2id pass — and the
+     * same on a desktop, where changing tabs was enough.
+     *
+     * A grace period covers the paste round-trip while still not leaving the
+     * vault open on a phone that has been put down. It is best-effort either
+     * way: iOS reclaims backgrounded tabs on its own schedule, and that discards
+     * the in-memory master key more thoroughly than this can.
+     */
     useEffect(() => {
-        const onHide = () => { if (document.visibilityState === 'hidden') lock(); };
-        document.addEventListener('visibilitychange', onHide);
-        return () => document.removeEventListener('visibilitychange', onHide);
+        let pending: ReturnType<typeof setTimeout> | null = null;
+
+        const onVisibilityChange = () => {
+            if (document.visibilityState === 'hidden') {
+                if (!pending) pending = setTimeout(lock, BACKGROUND_LOCK_MS);
+            } else if (pending) {
+                clearTimeout(pending);
+                pending = null;
+            }
+        };
+
+        document.addEventListener('visibilitychange', onVisibilityChange);
+        return () => {
+            document.removeEventListener('visibilitychange', onVisibilityChange);
+            if (pending) clearTimeout(pending);
+        };
     }, [lock]);
 
     const onCopy = useCallback((value: string, label: string) => {
@@ -452,9 +486,15 @@ export default function App() {
 
             {vault.unreadable.length > 0 && (
                 <p className="vw-error vw-inline-note" role="alert">
-                    <ShieldAlert size={14} /> {vault.unreadable.length} item
-                    {vault.unreadable.length === 1 ? '' : 's'} on the server would not open or
-                    verify, and {vault.unreadable.length === 1 ? 'is' : 'are'} not shown.
+                    <ShieldAlert size={14} />
+                    <span>
+                        {vault.unreadable.length} item{vault.unreadable.length === 1 ? '' : 's'} on
+                        the server {vault.unreadable.length === 1 ? 'is' : 'are'} sealed to a key
+                        this vault does not have, so {vault.unreadable.length === 1 ? 'it is' : 'they are'}
+                        {' '}not shown. Usually left behind by a key rotation, in which case
+                        {' '}{vault.unreadable.length === 1 ? 'it can' : 'they can'} never be opened
+                        again and should be deleted from the server.
+                    </span>
                 </p>
             )}
 

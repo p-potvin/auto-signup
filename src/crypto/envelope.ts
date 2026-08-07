@@ -104,6 +104,34 @@ export function openEnvelope(
     };
 }
 
+/**
+ * Whether this envelope was signed by the account that currently holds the vault.
+ *
+ * Deliberately signature-only, so it works while locked: `sigPublicKey` lives in
+ * the keychain in the clear, whereas opening an item needs the master key. Sync
+ * runs on a timer regardless of lock state and is exactly where this check has
+ * to happen.
+ *
+ * The case it exists for is key rotation. Items sealed by a retired keychain
+ * cannot be opened by the new one — ever — but the sync protocol has no idea:
+ * it pulled them back down, wrote them to local storage, and pushed them again
+ * on the next round, so a rotation left permanently unreadable items multiplying
+ * across every device.
+ */
+export function isSignedByThisAccount(
+    encryptedItem: EncryptedVaultItem,
+    sigPublicKey: Uint8Array,
+): boolean {
+    const { envelope } = encryptedItem;
+    if (!envelope || envelope.version !== ENVELOPE_VERSION) return false;
+    try {
+        return verify(signaturePayload(envelope), fromBase64(envelope.signature), sigPublicKey);
+    } catch {
+        // Malformed base64, wrong key length, truncated blob — all "not ours".
+        return false;
+    }
+}
+
 export function createVaultItem(
     itemType: ItemType,
     data: import('../types').VaultItemData,
