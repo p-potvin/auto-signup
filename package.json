@@ -5,9 +5,11 @@
   "private": true,
   "scripts": {
     "build": "webpack --mode production",
+    "build:pwa": "webpack --config webpack.pwa.config.js",
     "dev": "webpack --mode development --watch",
-    "clean": "rimraf dist",
-    "typecheck": "tsc --noEmit",
+    "dev:pwa": "webpack --config webpack.pwa.config.js --mode development --watch",
+    "clean": "rimraf dist dist-pwa",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.sw.json",
     "test:webauthn": "node test/webauthn-conformance.mjs",
     "test:import": "node test/import-parsers.mjs",
     "test:domain": "node test/domain-matching.mjs",
