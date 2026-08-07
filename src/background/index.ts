@@ -2,17 +2,18 @@ import { initKeychain, wrapAndStoreMasterKey, unwrapMasterKey, setCachedMasterKe
 import { createEnvelope, openEnvelope, createVaultItem, updateVaultItemTimestamp } from '../crypto/envelope';
 import { generateRecoveryKit, downloadRecoveryKit } from '../crypto/recovery';
 import { getEncryptedItems, saveEncryptedItem, deleteEncryptedItem, replaceAllEncryptedItems, getSettings, saveSettings, getSyncCursor, setSyncCursor } from '../utils/storage';
-import { getEncryptedIdentities, saveEncryptedIdentity, deleteEncryptedIdentity, encryptIdentity, decryptIdentity } from '../utils/identity-storage';
+import { getEncryptedIdentities, saveEncryptedIdentity, deleteEncryptedIdentity, replaceAllEncryptedIdentities, encryptIdentity, decryptIdentity } from '../utils/identity-storage';
 import { register as apiRegister } from '../api/auth';
 import { createVaultItem as apiCreateItem, updateVaultItem as apiUpdateItem, deleteVaultItem as apiDeleteItem } from '../api/vault';
 import { pushChanges, pullChanges } from '../api/sync';
-import { enqueueCreate, enqueueUpdate, enqueueDelete, processQueue, fullSync, startAutoSync } from '../api/sync-queue';
+import { enqueueCreate, enqueueUpdate, enqueueDelete, processQueue, fullSync, startAutoSync, clearQueue } from '../api/sync-queue';
 import { generateIdentity as generateIdentityApi } from '../api/generation';
 import { fetchAccountKey, putAccountKey, getIdentityVaultId, fetchSealedKeychain, putSealedKeychain } from '../api/warden';
 import { buildEnrollment, validateMasterPassword, type EnrollmentState } from '../crypto/enrollment';
 import { openAccountKeyBlob, openPortableKeychain, fromPortableKeychain } from '../crypto/account-key';
 import { prepareCeremony, performCreate, performGet, WebAuthnError, type PasskeyRecord, type VaultAccess } from '../webauthn/service';
 import type { SerializedCreationOptions, SerializedRequestOptions } from '../webauthn/types';
+import { localStore } from '../platform/store';
 import type { VaultItem, EncryptedVaultItem, ItemType, VaultItemData, VaultItemMetadata, VaultSettings, RecoveryKit, Identity, GeneratedIdentityData, PasskeyItem, LoginItem } from '../types';
 
 export type MessageType =
@@ -54,7 +55,8 @@ export type MessageType =
     | 'SAVE_LOGIN_FROM_PAGE'
     | 'GET_ENROLLMENT_STATE'
     | 'ENROLL_MASTER_PASSWORD'
-    | 'BOOTSTRAP_FROM_MASTER_PASSWORD';
+    | 'BOOTSTRAP_FROM_MASTER_PASSWORD'
+    | 'RESET_DEVICE';
 
 export interface Message {
     type: MessageType;
@@ -202,6 +204,39 @@ async function handleLock(): Promise<MessageResponse> {
 async function handleGetUnlocked(): Promise<MessageResponse> {
     const key = await getCachedMasterKey();
     return { success: true, data: { unlocked: key !== null } };
+}
+
+/**
+ * Destroys every key this device holds, so onboarding starts from nothing.
+ *
+ * This is key *rotation*, which the vault otherwise had no way to do: the KEM
+ * and signing keypairs are generated once at onboarding and there was no path
+ * to replace them. A leaked recovery kit — which carries both secret keys under
+ * the master key, plus the master key under a four-character PIN — cannot be
+ * answered any other way, because every item is sealed to that KEM public key.
+ *
+ * Deliberately local-only and deliberately destructive. Items on the server are
+ * left alone: they are sealed to the old keypair and unreadable after this, so
+ * deleting them is a separate decision made with the vault still open, not a
+ * side effect of resetting a device. `confirm` must be the literal string
+ * below, because a mis-sent message must not be able to erase a vault.
+ */
+async function handleResetDevice(payload: { confirm?: string } | undefined): Promise<MessageResponse> {
+    if (payload?.confirm !== 'RESET') {
+        return { success: false, error: 'reset requires an explicit confirmation' };
+    }
+    try {
+        await clearKeychain();
+        await localStore.remove([ENROLLED_AT_KEY]);
+        await replaceAllEncryptedItems([]);
+        await replaceAllEncryptedIdentities([]);
+        await clearQueue();
+        await setSyncCursor('');
+        if (lockTimer) clearTimeout(lockTimer);
+        return { success: true };
+    } catch (e) {
+        return { success: false, error: (e as Error).message };
+    }
 }
 
 async function handleGetItems(): Promise<MessageResponse> {
@@ -974,7 +1009,7 @@ async function handleGetEnrollmentState(): Promise<MessageResponse> {
         return { success: true, data: { status: 'uninitialised' } satisfies EnrollmentState };
     }
 
-    const stored = await chrome.storage.local.get(ENROLLED_AT_KEY) as Record<string, any>;
+    const stored = await localStore.get(ENROLLED_AT_KEY);
     const enrolledAt = stored[ENROLLED_AT_KEY] as string | undefined;
 
     let remoteKey = null;
@@ -1020,7 +1055,7 @@ async function handleEnrollMasterPassword(payload: { password: string; confirmat
         await putSealedKeychain(vaultId, bundle.sealedKeychain);
 
         const enrolledAt = new Date().toISOString();
-        await chrome.storage.local.set({ [ENROLLED_AT_KEY]: enrolledAt });
+        await localStore.set({ [ENROLLED_AT_KEY]: enrolledAt });
         flashSavedBadge();
 
         return { success: true, data: { status: 'enrolled', enrolledAt } satisfies EnrollmentState };
@@ -1052,7 +1087,7 @@ async function handleBootstrapFromMasterPassword(payload: { password: string; pi
         const deviceId = (await getKeychain())?.deviceId ?? crypto.randomUUID();
         const state = fromPortableKeychain(portable, deviceId);
 
-        await chrome.storage.local.set({ vw_keychain: state });
+        await localStore.set({ vw_keychain: state });
         await setCachedMasterKey(masterKey);
 
         // A local PIN is optional here; without one the master password is
@@ -1060,7 +1095,7 @@ async function handleBootstrapFromMasterPassword(payload: { password: string; pi
         if (payload.pin) {
             await wrapAndStoreMasterKey(masterKey, payload.pin);
         }
-        await chrome.storage.local.set({ [ENROLLED_AT_KEY]: new Date().toISOString() });
+        await localStore.set({ [ENROLLED_AT_KEY]: new Date().toISOString() });
         resetLockTimer();
 
         return { success: true, data: { deviceId } };
@@ -1188,6 +1223,9 @@ chrome.runtime.onMessage.addListener((message: Message, sender, sendResponse) =>
                 break;
             case 'ENROLL_MASTER_PASSWORD':
                 response = await handleEnrollMasterPassword(message.payload);
+                break;
+            case 'RESET_DEVICE':
+                response = await handleResetDevice(message.payload);
                 break;
             case 'BOOTSTRAP_FROM_MASTER_PASSWORD':
                 response = await handleBootstrapFromMasterPassword(message.payload);

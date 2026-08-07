@@ -23,6 +23,17 @@ async function saveQueue(queue: QueueEntry[]): Promise<void> {
     await localStore.set({ [QUEUE_KEY]: queue });
 }
 
+/**
+ * Drops everything waiting to be pushed.
+ *
+ * For device reset: queued entries carry envelopes sealed to a keypair that is
+ * about to stop existing, and pushing them after rotation would put items the
+ * new keychain cannot open back into the vault.
+ */
+export async function clearQueue(): Promise<void> {
+    await saveQueue([]);
+}
+
 export async function enqueueCreate(item: EncryptedVaultItem): Promise<void> {
     const queue = await getQueue();
     queue.push({

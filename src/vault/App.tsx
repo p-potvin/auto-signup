@@ -1248,6 +1248,95 @@ function SettingsPanel({ settings, onSave }: { settings: VaultSettings | null; o
                     {saved ? <><Check className="w-4 h-4" /> Saved</> : 'Save Settings'}
                 </button>
             </div>
+
+            <ResetDevicePanel />
+        </div>
+    );
+}
+
+/**
+ * Rotating the account keys, which is otherwise impossible.
+ *
+ * The KEM and signing keypairs are generated once during onboarding and nothing
+ * replaces them, so a leaked recovery kit — which carries both secret keys and
+ * the master key under a four-character PIN — has no answer except starting
+ * over. Every item is sealed to that KEM public key, so "rotate" and "wipe this
+ * device" are the same operation.
+ *
+ * Typing the word is the guard. A confirm() dialog is dismissible by muscle
+ * memory and this is not a recoverable action.
+ */
+function ResetDevicePanel() {
+    const [open, setOpen] = useState(false);
+    const [typed, setTyped] = useState('');
+    const [busy, setBusy] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+
+    const reset = async () => {
+        setBusy(true);
+        setError(null);
+        const resp = await chrome.runtime.sendMessage({ type: 'RESET_DEVICE', payload: { confirm: 'RESET' } });
+        if (!resp?.success) {
+            setError(resp?.error ?? 'Reset failed.');
+            setBusy(false);
+            return;
+        }
+        // Straight to onboarding rather than a success message: there is no
+        // vault left to return to, and every other view would render its empty
+        // state, which looks like a bug.
+        window.location.href = chrome.runtime.getURL('onboarding.html');
+    };
+
+    return (
+        <div className="vw-card p-6 mt-6 border-red-900/40">
+            <h2 className="text-sm font-semibold text-red-400">Reset this device</h2>
+            <p className="text-[13px] text-vw-console-text-secondary mt-1.5">
+                Destroys the account keys and every item stored here, then starts onboarding
+                fresh with a new keypair. This is how you rotate keys after a recovery kit
+                leaks — items are sealed to the old key, so there is no way to keep them.
+            </p>
+            <p className="text-[11px] text-vw-console-text-secondary/60 mt-1.5">
+                Items already synced to vault-warden are left alone and will be unreadable
+                afterwards. Delete them there first if you want them gone.
+            </p>
+
+            {!open ? (
+                <button
+                    onClick={() => setOpen(true)}
+                    className="mt-4 px-4 py-2 text-sm border border-red-900/60 text-red-400 rounded-lg hover:bg-red-950/30"
+                >
+                    Reset this device
+                </button>
+            ) : (
+                <div className="mt-4 space-y-2">
+                    <label className="block text-xs text-vw-console-text-secondary">
+                        Type <span className="font-mono text-red-400">RESET</span> to confirm.
+                    </label>
+                    <input
+                        value={typed}
+                        onChange={e => setTyped(e.target.value)}
+                        autoCapitalize="characters"
+                        spellCheck={false}
+                        className="px-3 py-2 bg-vw-console-surface border border-vw-console-border rounded-lg text-sm text-white focus:outline-none focus:border-red-500"
+                    />
+                    {error && <p className="text-xs text-red-400">{error}</p>}
+                    <div className="flex gap-2">
+                        <button
+                            disabled={typed !== 'RESET' || busy}
+                            onClick={reset}
+                            className="px-4 py-2 text-sm bg-red-900/60 text-red-100 rounded-lg disabled:opacity-40 hover:bg-red-900"
+                        >
+                            {busy ? 'Resetting…' : 'Erase and start over'}
+                        </button>
+                        <button
+                            onClick={() => { setOpen(false); setTyped(''); setError(null); }}
+                            className="px-4 py-2 text-sm text-vw-console-text-secondary hover:text-white"
+                        >
+                            Cancel
+                        </button>
+                    </div>
+                </div>
+            )}
         </div>
     );
 }
