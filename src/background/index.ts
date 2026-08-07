@@ -8,6 +8,9 @@ import { createVaultItem as apiCreateItem, updateVaultItem as apiUpdateItem, del
 import { pushChanges, pullChanges } from '../api/sync';
 import { enqueueCreate, enqueueUpdate, enqueueDelete, processQueue, fullSync, startAutoSync } from '../api/sync-queue';
 import { generateIdentity as generateIdentityApi } from '../api/generation';
+import { fetchAccountKey, putAccountKey, getIdentityVaultId, fetchSealedKeychain, putSealedKeychain } from '../api/warden';
+import { buildEnrollment, validateMasterPassword, type EnrollmentState } from '../crypto/enrollment';
+import { openAccountKeyBlob, openPortableKeychain, fromPortableKeychain } from '../crypto/account-key';
 import { prepareCeremony, performCreate, performGet, WebAuthnError, type PasskeyRecord, type VaultAccess } from '../webauthn/service';
 import type { SerializedCreationOptions, SerializedRequestOptions } from '../webauthn/types';
 import type { VaultItem, EncryptedVaultItem, ItemType, VaultItemData, VaultItemMetadata, VaultSettings, RecoveryKit, Identity, GeneratedIdentityData, PasskeyItem, LoginItem } from '../types';
@@ -48,7 +51,10 @@ export type MessageType =
     | 'QUEUE_SAVE_PROMPT'
     | 'GET_PENDING_SAVE'
     | 'CLEAR_PENDING_SAVE'
-    | 'SAVE_LOGIN_FROM_PAGE';
+    | 'SAVE_LOGIN_FROM_PAGE'
+    | 'GET_ENROLLMENT_STATE'
+    | 'ENROLL_MASTER_PASSWORD'
+    | 'BOOTSTRAP_FROM_MASTER_PASSWORD';
 
 export interface Message {
     type: MessageType;
@@ -61,6 +67,8 @@ export interface MessageResponse {
     error?: string;
     /** Set for WebAuthn failures so the page can throw the right DOMException. */
     errorName?: string;
+    /** False when vault-warden could not be reached for this answer. */
+    reachable?: boolean;
     /**
      * The vault was locked, so `data` is empty because nothing could be
      * decrypted — not because there is nothing stored.
@@ -950,6 +958,117 @@ async function handleSaveLoginFromPage(payload: {
     }
 }
 
+/* ------------------------------------------------------- enrollment */
+
+const ENROLLED_AT_KEY = 'vw_enrolled_at';
+
+/**
+ * What this device can do about multi-device right now.
+ *
+ * Reported rather than inferred in the UI because three of the four states look
+ * identical from the extension's own storage — the difference is whether the
+ * server already holds an account key, which only a round trip can answer.
+ */
+async function handleGetEnrollmentState(): Promise<MessageResponse> {
+    if (!await isInitialized()) {
+        return { success: true, data: { status: 'uninitialised' } satisfies EnrollmentState };
+    }
+
+    const stored = await chrome.storage.local.get(ENROLLED_AT_KEY) as Record<string, any>;
+    const enrolledAt = stored[ENROLLED_AT_KEY] as string | undefined;
+
+    let remoteKey = null;
+    let reachable = true;
+    try {
+        remoteKey = await fetchAccountKey();
+    } catch {
+        reachable = false;
+    }
+
+    if (enrolledAt && remoteKey) {
+        return { success: true, data: { status: 'enrolled', enrolledAt } satisfies EnrollmentState, reachable };
+    }
+    if (remoteKey) {
+        return { success: true, data: { status: 'remote-available' } satisfies EnrollmentState, reachable };
+    }
+    return { success: true, data: { status: 'local-only' } satisfies EnrollmentState, reachable };
+}
+
+/**
+ * Sets a master password on a vault that currently has only a local PIN.
+ *
+ * Requires the vault to be unlocked, because the master key it wraps only
+ * exists in memory while it is. Items are untouched: the password wraps the
+ * master key, and the master key is what items are sealed under.
+ */
+async function handleEnrollMasterPassword(payload: { password: string; confirmation: string }): Promise<MessageResponse> {
+    try {
+        const check = validateMasterPassword(payload.password, payload.confirmation);
+        if (!check.ok) return { success: false, error: check.reason };
+
+        const masterKey = await getCachedMasterKey();
+        if (!masterKey) return { success: false, error: 'Unlock the vault before setting a master password', locked: true };
+
+        const keychain = await getKeychain();
+        if (!keychain) return { success: false, error: 'Keychain not initialised' };
+
+        // Throws if the blobs do not round-trip, before anything is uploaded.
+        const bundle = buildEnrollment(masterKey, keychain, payload.password);
+
+        const vaultId = await getIdentityVaultId();
+        await putAccountKey(bundle.accountKey);
+        await putSealedKeychain(vaultId, bundle.sealedKeychain);
+
+        const enrolledAt = new Date().toISOString();
+        await chrome.storage.local.set({ [ENROLLED_AT_KEY]: enrolledAt });
+        flashSavedBadge();
+
+        return { success: true, data: { status: 'enrolled', enrolledAt } satisfies EnrollmentState };
+    } catch (e) {
+        return { success: false, error: (e as Error).message };
+    }
+}
+
+/**
+ * Brings a device online from the master password alone.
+ *
+ * This is the path a phone takes. Nothing local is written until the keychain
+ * has been decrypted and parsed, so a wrong password or an unreachable server
+ * leaves the device exactly as it was.
+ */
+async function handleBootstrapFromMasterPassword(payload: { password: string; pin?: string }): Promise<MessageResponse> {
+    try {
+        const accountKey = await fetchAccountKey();
+        if (!accountKey) return { success: false, error: 'This account has no master password enrolled yet' };
+
+        const masterKey = openAccountKeyBlob(accountKey, payload.password);
+        if (!masterKey) return { success: false, error: 'Incorrect master password' };
+
+        const vaultId = await getIdentityVaultId();
+        const sealed = await fetchSealedKeychain(vaultId);
+        if (!sealed) return { success: false, error: 'No keychain found on the server for this account' };
+
+        const portable = openPortableKeychain(sealed, masterKey);
+        const deviceId = (await getKeychain())?.deviceId ?? crypto.randomUUID();
+        const state = fromPortableKeychain(portable, deviceId);
+
+        await chrome.storage.local.set({ vw_keychain: state });
+        await setCachedMasterKey(masterKey);
+
+        // A local PIN is optional here; without one the master password is
+        // required on every unlock.
+        if (payload.pin) {
+            await wrapAndStoreMasterKey(masterKey, payload.pin);
+        }
+        await chrome.storage.local.set({ [ENROLLED_AT_KEY]: new Date().toISOString() });
+        resetLockTimer();
+
+        return { success: true, data: { deviceId } };
+    } catch (e) {
+        return { success: false, error: (e as Error).message };
+    }
+}
+
 chrome.runtime.onMessage.addListener((message: Message, sender, sendResponse) => {
     (async () => {
         let response: MessageResponse;
@@ -1063,6 +1182,15 @@ chrome.runtime.onMessage.addListener((message: Message, sender, sendResponse) =>
             case 'CLEAR_PENDING_SAVE':
                 if (sender.tab?.id !== undefined) await writePendingSave(sender.tab.id, null);
                 response = { success: true };
+                break;
+            case 'GET_ENROLLMENT_STATE':
+                response = await handleGetEnrollmentState();
+                break;
+            case 'ENROLL_MASTER_PASSWORD':
+                response = await handleEnrollMasterPassword(message.payload);
+                break;
+            case 'BOOTSTRAP_FROM_MASTER_PASSWORD':
+                response = await handleBootstrapFromMasterPassword(message.payload);
                 break;
             case 'SAVE_LOGIN_FROM_PAGE':
                 response = await handleSaveLoginFromPage(message.payload);

@@ -13,6 +13,7 @@ import { normalizeDomain, getHost, getFaviconUrl, getInitials, normalizeStoredUr
 import { t } from '../i18n/strings';
 import { useAutoUnlock } from '../utils/use-auto-unlock';
 import { ImportPanel } from './ImportPanel';
+import { EnrollPanel } from './EnrollPanel';
 
 /** A blank persona for the manual create path — no generation service involved. */
 function emptyIdentityData(): GeneratedIdentityData {
@@ -661,6 +662,7 @@ export default function App() {
                     {tab === 'settings' && (
                         <div className="space-y-6">
                             <SettingsPanel settings={settings} onSave={async (s) => { await send({ type: 'SAVE_SETTINGS', payload: s }); setSettings(s); }} />
+                            <EnrollPanel unlocked={unlocked} />
                             <ImportPanel existingItems={items} onImported={loadItems} />
                         </div>
                     )}

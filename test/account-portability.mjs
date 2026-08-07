@@ -29,6 +29,7 @@ function build() {
     execFileSync(process.execPath, [
         tsc,
         join(ROOT, 'src/crypto/account-key.ts'),
+        join(ROOT, 'src/crypto/enrollment.ts'),
         join(ROOT, 'src/crypto/envelope.ts'),
         join(ROOT, 'src/crypto/pqc.ts'),
         join(ROOT, 'src/crypto/symmetric.ts'),
@@ -39,7 +40,7 @@ function build() {
     ], { stdio: 'inherit' });
 
     // tsc roots at src/ because these files import ../types.
-    for (const rel of ['crypto/account-key.js', 'crypto/envelope.js', 'crypto/pqc.js', 'crypto/symmetric.js', 'types/index.js']) {
+    for (const rel of ['crypto/account-key.js', 'crypto/enrollment.js', 'crypto/envelope.js', 'crypto/pqc.js', 'crypto/symmetric.js', 'types/index.js']) {
         const file = join(outDir, rel);
         try {
             writeFileSync(
@@ -65,6 +66,7 @@ async function main() {
     build();
     const base = pathToFileURL(join(outDir, 'crypto')).href;
     const account = await import(`${base}/account-key.js`);
+    const enrollment = await import(`${base}/enrollment.js`);
     const envelope = await import(`${base}/envelope.js`);
     const pqc = await import(`${base}/pqc.js`);
     const symmetric = await import(`${base}/symmetric.js`);
@@ -173,6 +175,73 @@ async function main() {
 
     check('a 4-digit PIN is below the master-password floor',
         account.MIN_MASTER_PASSWORD_LENGTH > 4, `min=${account.MIN_MASTER_PASSWORD_LENGTH}`);
+
+    /* ---- enrollment ----------------------------------------------------- */
+
+    const reject = (pw, label) => {
+        const v = enrollment.validateMasterPassword(pw);
+        check(`password policy rejects ${label}`, v.ok === false, v.ok ? 'accepted!' : v.reason.slice(0, 48));
+    };
+    reject('1234', 'a 4-digit PIN');
+    reject('short', 'a short word');
+    reject('123456789012345', 'digits only, even when long');
+    check('password policy accepts a real passphrase',
+        enrollment.validateMasterPassword(PASSWORD).ok === true);
+    check('password policy catches a mistyped confirmation',
+        enrollment.validateMasterPassword(PASSWORD, PASSWORD + 'x').ok === false);
+
+    const bundle = enrollment.buildEnrollment(masterKey, deviceAState, PASSWORD);
+    check('enrollment produces both blobs',
+        !!bundle.accountKey?.protected_user_key && !!bundle.sealedKeychain);
+
+    // The self-check is the safety property: a bundle that cannot be reopened
+    // must never reach the server.
+    let selfCheckThrew = '';
+    try {
+        enrollment.assertBundleOpens(
+            { accountKey: bundle.accountKey, sealedKeychain: bundle.sealedKeychain },
+            'the-wrong-password-entirely',
+            account.toPortableKeychain(deviceAState),
+        );
+    } catch (e) { selfCheckThrew = e.message; }
+    check('self-check rejects a bundle that will not reopen',
+        /does not open/i.test(selfCheckThrew), selfCheckThrew.slice(0, 60));
+
+    let corruptThrew = '';
+    try {
+        enrollment.assertBundleOpens(
+            { accountKey: bundle.accountKey, sealedKeychain: account.sealPortableKeychain(
+                { ...account.toPortableKeychain(deviceAState), kemPublicKey: 'tampered' },
+                masterKey,
+            ) },
+            PASSWORD,
+            account.toPortableKeychain(deviceAState),
+        );
+    } catch (e) { corruptThrew = e.message; }
+    check('self-check rejects a keychain that does not round-trip',
+        /round-trip/i.test(corruptThrew), corruptThrew.slice(0, 60));
+
+    let weakThrew = '';
+    try { enrollment.buildEnrollment(masterKey, deviceAState, '1234'); }
+    catch (e) { weakThrew = e.message; }
+    check('enrollment refuses a weak password before building anything',
+        /at least/i.test(weakThrew), weakThrew.slice(0, 48));
+
+    // A device bootstrapped purely from the enrollment bundle must reach items.
+    const bootKey = account.openAccountKeyBlob(bundle.accountKey, PASSWORD);
+    const bootChain = account.openPortableKeychain(bundle.sealedKeychain, bootKey);
+    const bootSecret = symmetric.decrypt(
+        pqc.fromBase64(bootChain.kemSecretKeyEnc.ciphertext),
+        pqc.fromBase64(bootChain.kemSecretKeyEnc.nonce),
+        bootKey,
+    );
+    check('*** a device bootstrapped from the enrollment bundle opens items ***',
+        envelope.openEnvelope(sealedItem, bootSecret, pqc.fromBase64(bootChain.sigPublicKey)).data.password === 'hunter2');
+
+    check('enrollment state copy is written for each status',
+        ['uninitialised', 'local-only', 'remote-available'].every(
+            status => enrollment.describeEnrollment({ status }).length > 20)
+        && enrollment.describeEnrollment({ status: 'enrolled', enrolledAt: new Date(0).toISOString() }).length > 20);
 
     const failed = results.filter(r => !r.ok);
     console.log(`\n${results.length - failed.length}/${results.length} checks passed`);
