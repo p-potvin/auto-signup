@@ -8,6 +8,8 @@
     "build:pwa": "rimraf dist-pwa && webpack --config webpack.pwa.config.js",
     "dev": "webpack --mode development --watch",
     "dev:pwa": "rimraf dist-pwa && webpack --config webpack.pwa.config.js --mode development --watch",
+    "serve:pwa": "node scripts/serve-pwa.mjs 5199",
+    "mock:warden": "node scripts/mock-warden.mjs 5200",
     "clean": "rimraf dist dist-pwa",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.sw.json",
     "test:webauthn": "node test/webauthn-conformance.mjs",

@@ -20,6 +20,12 @@ const { version } = require('./package.json');
 
 const OUT = path.resolve(__dirname, 'dist-pwa');
 
+// Stamped once per invocation, so both configs below agree. The service worker
+// keys its cache on this: the package version alone never moved between builds,
+// so `activate` never found a stale cache to delete and cache-first kept serving
+// the previous bundle after a deploy.
+const BUILD_ID = Date.now().toString(36);
+
 const tsRule = (configFile) => ({
     test: /\.tsx?$/,
     exclude: /node_modules/,
@@ -51,7 +57,10 @@ const app = {
         ],
     },
     plugins: [
-        new webpack.DefinePlugin({ __VW_VERSION__: JSON.stringify(version) }),
+        new webpack.DefinePlugin({
+            __VW_VERSION__: JSON.stringify(version),
+            __VW_BUILD__: JSON.stringify(BUILD_ID),
+        }),
         new MiniCssExtractPlugin({ filename: '[name].css' }),
         new HtmlWebpackPlugin({
             template: './src/mobile/index.html',
@@ -91,7 +100,10 @@ const serviceWorker = {
     // Its own tsconfig: lib.webworker and lib.dom both declare `self`, so a
     // service worker cannot be typechecked under the app's DOM config.
     module: { rules: [tsRule('tsconfig.sw.json')] },
-    plugins: [new webpack.DefinePlugin({ __VW_VERSION__: JSON.stringify(version) })],
+    plugins: [new webpack.DefinePlugin({
+        __VW_VERSION__: JSON.stringify(version),
+        __VW_BUILD__: JSON.stringify(BUILD_ID),
+    })],
 };
 
 module.exports = [app, serviceWorker];

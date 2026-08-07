@@ -7,7 +7,15 @@
  * place a password will sit, and worth clearing.
  */
 
-const CLEAR_AFTER_MS = 30_000;
+/**
+ * How long a copied secret stays on the clipboard.
+ *
+ * Two minutes rather than thirty seconds: pasting on a phone means leaving this
+ * app, and a password that evaporates while you are still finding the field is
+ * worse than useless — you go back and copy it again, so the secret spends
+ * *more* time on the clipboard, not less.
+ */
+const CLEAR_AFTER_MS = 120_000;
 
 export type ClipboardState =
     | { status: 'idle' }

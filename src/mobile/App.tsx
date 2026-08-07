@@ -26,12 +26,17 @@ import { copySecret, cancelPendingClear, type ClipboardState } from './clipboard
 /**
  * How long the vault may sit in the background before it locks.
  *
- * Two minutes is sized to the paste round-trip — copy here, switch, paste,
- * come back — with room for a password field that wants a second attempt. The
- * clipboard clears at 30s regardless, so the exposed secret is already gone
- * well before this fires.
+ * Ten minutes, because two was still too short in practice: a paste is rarely
+ * the end of it — you sign in, the site wants a code, you go back for the TOTP,
+ * something interrupts you. Re-deriving the master key costs an Argon2id pass
+ * on a phone, so locking early is not free.
+ *
+ * The exposure this bounds is a vault left unlocked in a backgrounded tab. iOS
+ * reclaims those on its own schedule anyway, which discards the in-memory key
+ * more thoroughly than this can, and the device lock screen is the real
+ * boundary.
  */
-const BACKGROUND_LOCK_MS = 120_000;
+const BACKGROUND_LOCK_MS = 600_000;
 
 /* ------------------------------------------------------------------ chrome */
 
@@ -39,8 +44,13 @@ function StatusBanner({ state, onDismiss }: { state: ClipboardState; onDismiss: 
     if (state.status === 'idle') return null;
 
     const tone = state.status === 'clear-failed' ? 'warn' : 'ok';
+    // Coarse above a minute: a two-minute countdown ticking every second reads
+    // as a timer you are supposed to race.
+    const remaining = state.status === 'copied'
+        ? (state.secondsLeft >= 60 ? `${Math.ceil(state.secondsLeft / 60)} min` : `${state.secondsLeft}s`)
+        : '';
     const text =
-        state.status === 'copied' ? `${state.label} copied — clearing in ${state.secondsLeft}s`
+        state.status === 'copied' ? `${state.label} copied — clears in ${remaining}`
         : state.status === 'cleared' ? 'Clipboard cleared'
         : state.detail;
 
@@ -164,12 +174,36 @@ function UnlockScreen({
     };
 
     return (
-        <form className="vw-gate" onSubmit={submit}>
+        <form className="vw-gate" onSubmit={submit} method="post" action="#">
             <Lock size={40} />
             <h1>VaultWares</h1>
-            <p>Enter your master password.</p>
+            <p>Unlocking as <strong>{account.login}</strong></p>
+
+            {/*
+              * Present so iOS Password AutoFill has something to associate a
+              * saved credential with. Safari treats a lone password box as
+              * ambiguous and will not reliably offer the password back, which is
+              * the difference between Face ID and retyping a passphrase on a
+              * phone keyboard every time.
+              *
+              * readOnly rather than hidden: a hidden field is ignored by the
+              * heuristic, and there is genuinely only one account here — it is
+              * whoever the tailnet says you are, which is not yours to edit.
+              */}
+            <input
+                type="text"
+                name="username"
+                autoComplete="username"
+                value={account.login}
+                readOnly
+                aria-label="Account"
+                className="vw-account-field"
+                tabIndex={-1}
+            />
+
             <input
                 type="password"
+                name="password"
                 inputMode="text"
                 autoComplete="current-password"
                 autoCapitalize="none"
@@ -209,6 +243,17 @@ function itemSubtitle(item: VaultItem): string {
     }
 }
 
+/**
+ * One field, with the whole row as the copy target.
+ *
+ * Copying is the only thing this app can do with a password, so it gets the
+ * whole row rather than an 18px icon — a small target for the single most
+ * common action, on the device with the least precise pointer, is the wrong way
+ * round. The copy icon stays as the affordance that says what tapping does.
+ *
+ * Reveal stays a separate button inside the row and stops propagation, so
+ * looking at a password never puts it on the clipboard as a side effect.
+ */
 function CopyRow({
     label,
     value,
@@ -225,20 +270,30 @@ function CopyRow({
 
     return (
         <div className="vw-row">
-            <div className="vw-row-text">
-                <span className="vw-row-label">{label}</span>
-                <span className={`vw-row-value${secret && !revealed ? ' vw-masked' : ''}`}>
-                    {secret && !revealed ? '••••••••••••' : value}
+            <button
+                type="button"
+                className="vw-row-tap"
+                aria-label={`Copy ${label}`}
+                onClick={() => onCopy(value, label)}
+            >
+                <span className="vw-row-text">
+                    <span className="vw-row-label">{label}</span>
+                    <span className={`vw-row-value${secret && !revealed ? ' vw-masked' : ''}`}>
+                        {secret && !revealed ? '••••••••••••' : value}
+                    </span>
                 </span>
-            </div>
+                <Copy size={20} className="vw-row-icon" aria-hidden="true" />
+            </button>
             {secret && (
-                <button type="button" aria-label={revealed ? `Hide ${label}` : `Show ${label}`} onClick={() => setRevealed(r => !r)}>
-                    {revealed ? <EyeOff size={18} /> : <Eye size={18} />}
+                <button
+                    type="button"
+                    className="vw-row-eye"
+                    aria-label={revealed ? `Hide ${label}` : `Show ${label}`}
+                    onClick={e => { e.stopPropagation(); setRevealed(r => !r); }}
+                >
+                    {revealed ? <EyeOff size={20} /> : <Eye size={20} />}
                 </button>
             )}
-            <button type="button" aria-label={`Copy ${label}`} onClick={() => onCopy(value, label)}>
-                <Copy size={18} />
-            </button>
         </div>
     );
 }
@@ -279,12 +334,17 @@ function TotpRow({
 
     return (
         <div className="vw-row">
-            <div className="vw-row-text">
-                <span className="vw-row-label">One-time code · {remaining}s</span>
-                <span className="vw-row-value vw-totp">{code}</span>
-            </div>
-            <button type="button" aria-label="Copy one-time code" onClick={() => onCopy(code, 'One-time code')}>
-                <Copy size={18} />
+            <button
+                type="button"
+                className="vw-row-tap"
+                aria-label="Copy one-time code"
+                onClick={() => onCopy(code, 'One-time code')}
+            >
+                <span className="vw-row-text">
+                    <span className="vw-row-label">One-time code · {remaining}s</span>
+                    <span className="vw-row-value vw-totp">{code}</span>
+                </span>
+                <Copy size={20} className="vw-row-icon" aria-hidden="true" />
             </button>
         </div>
     );
