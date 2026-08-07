@@ -35,9 +35,13 @@ const app = {
     output: {
         path: OUT,
         filename: '[name].js',
-        // The service worker is emitted by the second config below, into the
-        // same directory, so only this one may clean it.
-        clean: true,
+        // Neither config may clean: webpack runs an array of configs in
+        // parallel, and both emit into dist-pwa. The service worker compiles in
+        // a fraction of the app's time, so `clean: true` here deleted a
+        // service-worker.js that had already been written — a silent 404 that
+        // only showed up as "offline shell unavailable" in the console. The
+        // build script wipes the directory once, up front, instead.
+        clean: false,
     },
     resolve: { extensions: ['.tsx', '.ts', '.js', '.jsx'] },
     module: {
