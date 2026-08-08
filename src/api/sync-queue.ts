@@ -154,7 +154,7 @@ export async function fullSync(
 
         const merged = [...localItems];
         let foreignFromServer = 0;
-        for (const remoteItem of pullResp.items) {
+        for (const remoteItem of pullResp.items ?? []) {
             const idx = merged.findIndex(i => i.id === remoteItem.id);
             if (remoteItem.deletedAt) {
                 // Remote tombstone wins — drop it locally.
