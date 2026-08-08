@@ -70,9 +70,24 @@ const app = {
         new CopyWebpackPlugin({
             patterns: [
                 { from: 'public/pwa/manifest.webmanifest', to: 'manifest.webmanifest' },
-                { from: 'public/icons/icon-180.png', to: 'icons/icon-180.png' },
-                { from: 'public/icons/icon-192.png', to: 'icons/icon-192.png' },
-                { from: 'public/icons/icon-512.png', to: 'icons/icon-512.png' },
+                // favicon.ico at the root, because browsers request /favicon.ico
+                // regardless of what the document links to.
+                { from: 'public/icons/favicon.ico', to: 'favicon.ico' },
+                {
+                    from: 'public/icons',
+                    to: 'icons',
+                    // Named individually rather than globbed: public/icons also
+                    // holds the extension's icons, the 1024px masters and the
+                    // build script, and none of that belongs on a phone.
+                    filter: absolutePath => [
+                        'icon-180.png',
+                        'icon-192.png',
+                        'icon-512.png',
+                        'icon-maskable-512.png',
+                        'favicon-16.png',
+                        'favicon-32.png',
+                    ].includes(path.basename(absolutePath)),
+                },
             ],
         }),
     ],

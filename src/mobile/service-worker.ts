@@ -41,8 +41,13 @@ const SHELL = [
     './mobile.js',
     './mobile.css',
     './manifest.webmanifest',
+    './favicon.ico',
+    './icons/icon-180.png',
     './icons/icon-192.png',
     './icons/icon-512.png',
+    './icons/icon-maskable-512.png',
+    './icons/favicon-16.png',
+    './icons/favicon-32.png',
 ];
 
 self.addEventListener('install', event => {
