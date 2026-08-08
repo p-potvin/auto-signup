@@ -2,6 +2,9 @@ import { getEncryptedItems, getSyncCursor, setSyncCursor, replaceAllEncryptedIte
 import { pushChanges, pullChanges } from '../api/sync';
 import type { EncryptedVaultItem } from '../types';
 import { localStore } from '../platform/store';
+import { getKeychain } from '../crypto/keychain';
+import { isSignedByThisAccount } from '../crypto/envelope';
+import { fromBase64 } from '../crypto/pqc';
 
 const QUEUE_KEY = 'vw_sync_queue';
 
@@ -117,9 +120,29 @@ export async function processQueue(): Promise<{ processed: number; failed: numbe
 
 export async function fullSync(
     extraDeletes: SyncTombstone[] = [],
-): Promise<{ pushed: number; pulled: number; ok: boolean }> {
+): Promise<{ pushed: number; pulled: number; foreign: number; ok: boolean }> {
     try {
-        const localItems = await getEncryptedItems();
+        // Envelopes not signed by the current account are dropped on both legs.
+        // After a key rotation the server still holds items sealed by the
+        // retired keychain; without this they are pulled into local storage,
+        // pushed back on the next round, and multiply across every device while
+        // being permanently unopenable. Signature verification needs only the
+        // public half, so this works while the vault is locked — which is when
+        // the timer-driven sync usually runs.
+        const keychain = await getKeychain();
+        if (!keychain?.sigPublicKey) {
+            // No account yet, or mid-reset. Syncing here would push whatever
+            // happens to be left in storage against an account it may not
+            // belong to.
+            return { pushed: 0, pulled: 0, foreign: 0, ok: false };
+        }
+        const sigPublicKey = fromBase64(keychain.sigPublicKey);
+        const isOurs = (item: EncryptedVaultItem) => isSignedByThisAccount(item, sigPublicKey);
+
+        const storedItems = await getEncryptedItems();
+        const localItems = storedItems.filter(isOurs);
+        const droppedLocally = storedItems.length - localItems.length;
+
         const cursor = await getSyncCursor();
 
         const pushPayload = [...localItems, ...extraDeletes];
@@ -130,11 +153,16 @@ export async function fullSync(
         await setSyncCursor(pullResp.cursor);
 
         const merged = [...localItems];
-        for (const remoteItem of pullResp.items) {
+        let foreignFromServer = 0;
+        for (const remoteItem of pullResp.items ?? []) {
             const idx = merged.findIndex(i => i.id === remoteItem.id);
             if (remoteItem.deletedAt) {
                 // Remote tombstone wins — drop it locally.
                 if (idx >= 0) merged.splice(idx, 1);
+                continue;
+            }
+            if (!isOurs(remoteItem)) {
+                foreignFromServer += 1;
                 continue;
             }
             if (idx >= 0) {
@@ -148,11 +176,18 @@ export async function fullSync(
             }
         }
 
+        // Rewrites storage even when nothing came down, so items dropped above
+        // stop being re-read and re-pushed forever.
         await replaceAllEncryptedItems(merged);
-        return { pushed: pushPayload.length, pulled: pullResp.items.length, ok: true };
+        return {
+            pushed: pushPayload.length,
+            pulled: pullResp.items.length,
+            foreign: droppedLocally + foreignFromServer,
+            ok: true,
+        };
     } catch (e) {
         console.warn('Full sync failed:', e);
-        return { pushed: 0, pulled: 0, ok: false };
+        return { pushed: 0, pulled: 0, foreign: 0, ok: false };
     }
 }
 

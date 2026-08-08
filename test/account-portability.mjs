@@ -243,6 +243,50 @@ async function main() {
             status => enrollment.describeEnrollment({ status }).length > 20)
         && enrollment.describeEnrollment({ status: 'enrolled', enrolledAt: new Date(0).toISOString() }).length > 20);
 
+    /* ---- rotation: items from a retired keychain must be disowned -------- */
+    //
+    // Observed on a live vault: after rotating, three items sealed by the old
+    // keychain were pulled back out of the server into local storage, pushed up
+    // again on the next round, and were permanently unopenable. Sync has to be
+    // able to tell whose an envelope is *while locked*, which means signature
+    // only — the master key is not available to open anything.
+
+    const rotatedSig = pqc.generateSigKeyPair();
+    const rotatedKem = pqc.generateKemKeyPair();
+
+    check('an envelope verifies against the key that signed it',
+        envelope.isSignedByThisAccount(sealedItem, sigKp.publicKey));
+    check('*** the same envelope is disowned after rotation ***',
+        !envelope.isSignedByThisAccount(sealedItem, rotatedSig.publicKey));
+
+    const afterRotation = envelope.createEnvelope(
+        envelope.createVaultItem('login', { url: 'x.test', username: '', email: '', password: 'p' },
+            { label: 'x.test', tags: [], favorite: false }, 'device-c'),
+        rotatedKem.publicKey, rotatedSig.secretKey, 'device-c',
+    );
+    check('an item sealed after rotation verifies under the new key',
+        envelope.isSignedByThisAccount(afterRotation, rotatedSig.publicKey));
+    check('and is itself disowned by the old key',
+        !envelope.isSignedByThisAccount(afterRotation, sigKp.publicKey));
+
+    // The checks below are the ones that keep a corrupt or hostile blob from
+    // being adopted as "ours" through some path other than a real signature.
+    const tamperedMeta = JSON.parse(JSON.stringify(sealedItem));
+    tamperedMeta.envelope.metadata.label = 'not what was signed';
+    check('metadata tampering is caught', !envelope.isSignedByThisAccount(tamperedMeta, sigKp.publicKey));
+
+    const wrongVersion = JSON.parse(JSON.stringify(sealedItem));
+    wrongVersion.envelope.version = 99;
+    check('an unknown envelope version is not ours', !envelope.isSignedByThisAccount(wrongVersion, sigKp.publicKey));
+
+    const junkSignature = JSON.parse(JSON.stringify(sealedItem));
+    junkSignature.envelope.signature = 'not base64 !!!';
+    check('a malformed signature returns false rather than throwing',
+        envelope.isSignedByThisAccount(junkSignature, sigKp.publicKey) === false);
+
+    check('a missing envelope is not ours',
+        envelope.isSignedByThisAccount({ id: 'x', envelope: null, deletedAt: null }, sigKp.publicKey) === false);
+
     const failed = results.filter(r => !r.ok);
     console.log(`\n${results.length - failed.length}/${results.length} checks passed`);
     if (failed.length) {

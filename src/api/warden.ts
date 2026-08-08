@@ -36,6 +36,28 @@ interface WardenItemSummary {
     updated_at: string;
 }
 
+/* ------------------------------------------------------------- identity */
+
+export interface WardenWhoami {
+    login: string;
+    display_name: string;
+    node: string;
+    is_local: boolean;
+    enrolled: boolean;
+}
+
+/**
+ * The tailnet identity this device resolves to.
+ *
+ * Worth showing on an unlock screen for its own sake, and required by iOS:
+ * Password AutoFill will not reliably offer a saved credential back to a form
+ * that is a lone password box, so the unlock form needs a real username to
+ * associate with this origin.
+ */
+export async function fetchWhoami(): Promise<WardenWhoami> {
+    return localFetch<WardenWhoami>('/whoami');
+}
+
 /* ---------------------------------------------------------- account key */
 
 /** Returns null when no key is enrolled yet (vault-warden answers 404). */

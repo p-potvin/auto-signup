@@ -30,7 +30,10 @@ html, body {
     background: var(--vw-bg);
     color: var(--vw-text);
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
-    font-size: 16px;
+    /* 18px, not 16: this is read at arm's length, one-handed, often in a hurry,
+       and the content is unguessable strings where misreading a character
+       matters. Everything below is sized in rem off this. */
+    font-size: 18px;
     line-height: 1.45;
     /* The list scrolls; the page does not, so a rubber-band drag does not peel
        the header off the top on iOS. */
@@ -161,27 +164,31 @@ input:focus { outline: none; border-color: var(--vw-accent); }
 .vw-list button {
     width: 100%;
     justify-content: flex-start;
-    padding: 10px 8px;
-    min-height: 60px;
+    padding: 12px 8px;
+    /* Comfortably past the 44px floor: this list is scrolled and tapped with a
+       thumb while walking, and the cost of a mis-tap is opening the wrong
+       account and having to go back. */
+    min-height: 72px;
+    gap: 14px;
     border-radius: 0;
     text-align: left;
 }
 
 .vw-avatar {
     flex: none;
-    width: 40px;
-    height: 40px;
-    border-radius: 10px;
+    width: 46px;
+    height: 46px;
+    border-radius: 12px;
     background: var(--vw-surface-2);
     color: var(--vw-muted);
     display: grid;
     place-items: center;
-    font-size: 0.8125rem;
+    font-size: 0.875rem;
     font-weight: 600;
 }
 
 .vw-list-text { display: flex; flex-direction: column; min-width: 0; }
-.vw-list-label { font-weight: 500; }
+.vw-list-label { font-weight: 500; font-size: 1.0625rem; }
 
 .vw-list-sub,
 .vw-list-label {
@@ -221,27 +228,63 @@ input:focus { outline: none; border-color: var(--vw-accent); }
 
 .vw-row {
     display: flex;
-    align-items: center;
+    align-items: stretch;
     gap: 4px;
-    padding: 8px 4px 8px 12px;
     border-bottom: 1px solid var(--vw-border);
 }
 
+/* The copy target: the whole row, not the icon. */
+.vw-row-tap {
+    flex: 1;
+    min-width: 0;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 14px 8px 14px 12px;
+    border-radius: 0;
+    text-align: left;
+}
+
+.vw-row-icon { flex: none; color: var(--vw-muted); }
+.vw-row-tap:active .vw-row-icon { color: var(--vw-accent); }
+
+.vw-row-eye { flex: none; color: var(--vw-muted); border-radius: 0; }
+
 .vw-row-text { flex: 1; display: flex; flex-direction: column; min-width: 0; }
-.vw-row-label { color: var(--vw-muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; }
+
+.vw-row-label {
+    color: var(--vw-muted);
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
 
 .vw-row-value {
     /* Wraps rather than truncating: a password you cannot read in full is not
        much use when the copy has failed. */
     overflow-wrap: anywhere;
+    font-size: 1.0625rem;
 }
 
 .vw-masked { letter-spacing: 0.15em; color: var(--vw-muted); }
 
 .vw-totp {
     font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-    font-size: 1.375rem;
+    font-size: 1.625rem;
     letter-spacing: 0.12em;
+}
+
+/* Present only so iOS Password AutoFill has a username to associate with this
+   origin. Kept in the layout — `display: none` is skipped by the heuristic — but
+   small, quiet and out of the tab order, because it is not a field to fill in. */
+.vw-account-field {
+    max-width: 22rem;
+    padding: 6px 10px;
+    font-size: 0.8125rem;
+    color: var(--vw-muted);
+    background: transparent;
+    border-color: transparent;
+    text-align: center;
+    pointer-events: none;
 }
 
 /* ------------------------------------------------------------------ toast */

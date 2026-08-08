@@ -24,7 +24,7 @@ import {
 import { decrypt } from '../crypto/symmetric';
 import { fromBase64 } from '../crypto/pqc';
 import { openEnvelope } from '../crypto/envelope';
-import { fetchAccountKey, fetchSealedKeychain, getIdentityVaultId } from '../api/warden';
+import { fetchAccountKey, fetchSealedKeychain, getIdentityVaultId, fetchWhoami } from '../api/warden';
 import { pullChanges } from '../api/sync';
 import type { VaultItem } from '../types';
 
@@ -33,9 +33,9 @@ export type AccountState =
     /** vault-warden did not answer. Off the tailnet, or the service is down. */
     | { status: 'unreachable'; detail: string }
     /** Reachable, but no master password has been set from another device yet. */
-    | { status: 'not-enrolled'; identityVaultId: number }
+    | { status: 'not-enrolled'; identityVaultId: number; login: string }
     /** Ready for a password. */
-    | { status: 'ready'; identityVaultId: number; accountKey: AccountKeyBlob };
+    | { status: 'ready'; identityVaultId: number; login: string; accountKey: AccountKeyBlob };
 
 export interface UnlockedVault {
     items: VaultItem[];
@@ -45,8 +45,13 @@ export interface UnlockedVault {
 
 export async function probeAccount(): Promise<AccountState> {
     let identityVaultId: number;
+    let login: string;
     try {
         identityVaultId = await getIdentityVaultId();
+        // Not fatal on its own — it only names the account and feeds the
+        // autofill association — but it comes from the same server on the same
+        // hop, so a failure here means the next call was going to fail anyway.
+        login = (await fetchWhoami()).login;
     } catch (e) {
         return { status: 'unreachable', detail: (e as Error).message };
     }
@@ -58,8 +63,8 @@ export async function probeAccount(): Promise<AccountState> {
         return { status: 'unreachable', detail: (e as Error).message };
     }
 
-    if (!accountKey) return { status: 'not-enrolled', identityVaultId };
-    return { status: 'ready', identityVaultId, accountKey };
+    if (!accountKey) return { status: 'not-enrolled', identityVaultId, login };
+    return { status: 'ready', identityVaultId, login, accountKey };
 }
 
 /**

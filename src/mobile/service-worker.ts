@@ -16,10 +16,24 @@ export {};
 
 declare const self: ServiceWorkerGlobalScope;
 
-// Replaced at build time so a deploy invalidates the previous shell.
 declare const __VW_VERSION__: string;
 
-const CACHE = `vaultwares-shell-${__VW_VERSION__}`;
+/**
+ * Changes on every build.
+ *
+ * The cache name used to be the package version, which was wrong in a way that
+ * only shows up after a deploy: the version does not move between builds, so
+ * the name never changed, `activate` found nothing stale to delete, and
+ * cache-first kept serving the previous `mobile.js` forever. A shipped fix
+ * would simply not arrive.
+ *
+ * nginx sends this file `no-cache`, so the browser always re-fetches it, sees a
+ * byte-different script, and installs the new worker — which is what makes a
+ * changing name here sufficient.
+ */
+declare const __VW_BUILD__: string;
+
+const CACHE = `vaultwares-shell-${__VW_VERSION__}-${__VW_BUILD__}`;
 
 const SHELL = [
     './',
@@ -27,8 +41,13 @@ const SHELL = [
     './mobile.js',
     './mobile.css',
     './manifest.webmanifest',
+    './favicon.ico',
+    './icons/icon-180.png',
     './icons/icon-192.png',
     './icons/icon-512.png',
+    './icons/icon-maskable-512.png',
+    './icons/favicon-16.png',
+    './icons/favicon-32.png',
 ];
 
 self.addEventListener('install', event => {
