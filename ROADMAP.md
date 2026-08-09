@@ -8,23 +8,32 @@ A privacy-first identity vault that lets users:
 - Generate fully fictional but realistic personas for online sign-ups
 - Detect sign-up and login pages in the browser and suggest either a new fictional identity or an existing domain-linked one
 - Manage the same encrypted vault across browser, desktop, iOS, and Android clients
-  - **Blocked today.** Vault sync is local-only (the extension syncs to a
-    `vault-warden` on the same machine), so devices share nothing. Reaching this
-    goal means putting users on their own tailnet and pointing their devices at
-    one shared `vault-warden` over it, then provisioning the account key to each
-    approved device. See `docs/crypto-status.md`.
+  - **Shipped for browser and phone.** The extension and the mobile PWA both
+    reach one `vault-warden` on greencloud over the tailnet and open the same
+    vault from a master password. Identity is bound to the Tailscale *user*, so
+    every device a person adds is the same account.
+  - **Native iOS and Android are not planned.** See Phase 3 for the reasoning;
+    it is a decision, not a backlog item.
 
 **Not intended for:** impersonation, KYC bypass, forged identity documents, reference-image cloning, or evasive abuse automation.
 
 ## Current State (v2.1)
 
 - Browser extension (Chrome + Firefox 128+ MV3) with PQC crypto, vault UI, popup, content script, onboarding
+- **Mobile vault (PWA)**, served by nginx at `warden.vaultwares.ca` — same origin
+  as the API, tailnet-only. Master-password unlock, search, one-tap copy with a
+  clipboard timer, TOTP, offline shell. Read-only by design; see Phase 3.
 - **Passkeys:** the extension is a real WebAuthn authenticator — it creates ES256
   credentials, stores the private keys in the encrypted vault, and signs
   assertions. See `docs/passkeys.md`
 - **Identities without AI:** personas can be created and edited by hand;
   generation is an optional convenience over the same editor
-- 14 API endpoints under `/v1/` in `vaultwares-api` (auth, vault CRUD, sync, devices)
+- **Vault sync targets `vault-warden` on greencloud**, not `vaultwares-api`:
+  `POST /v1/identity/sync` and `GET /v1/identity/sync/changes` for items,
+  `PUT/GET /v1/account/key` for the wrapped account key. Authentication is the
+  tailnet itself (`tailscale whois`), so there is no token to copy onto a phone.
+  The 14 `/v1/` endpoints in `vaultwares-api` are a separate, older surface and
+  are not what the clients talk to.
 - Zero-knowledge encryption: ML-KEM-768, ML-DSA-65, AES-256-GCM, Argon2id KDF
 - Encrypted local cache with sync-ready records
 
@@ -62,12 +71,39 @@ A privacy-first identity vault that lets users:
 
 ### Phase 3 — Companion Clients
 
-- [ ] Desktop app (full vault-management client)
-- [ ] iOS app + Password AutoFill extension
-- [ ] Android app + AutofillService
+- [x] Mobile vault as a PWA (unlock, search, copy, TOTP, offline shell)
+- [ ] Desktop app (full vault-management client) — the remaining client
+- [ ] PWA editing and offline writes
+- [ ] WebAuthn unlock (Face ID) for the PWA, as a relying party
 - [ ] Mock subscription and entitlement surfaces
 - [ ] Cross-platform QA matrix
 - [ ] Keep paid/telecom/network features mocked
+
+#### Not planned: native iOS and Android — decided 2026-08-08
+
+Do not re-propose these. The reasoning, so it does not have to be rediscovered:
+
+- **No Mac, no Xcode, no paid Apple Developer Program.** That rules out a native
+  app and a Safari Web Extension outright — Xcode is mandatory to build or sign
+  either.
+- **`ASCredentialProviderExtension` is the only thing that gives real autofill on
+  iOS**, and a PWA gets none of it. Copy-paste is the ceiling. Say so plainly
+  rather than implying parity.
+- **Sideloading does not rescue it.** A free Apple ID cannot use App Groups,
+  which is the normal channel an autofill extension uses to read the containing
+  app's vault, and its provisioning profiles expire every 7 days. A password
+  manager that stops launching weekly fails at exactly the moment it is needed.
+  Whether the autofill entitlement itself is grantable on a free team is
+  unverified — the cheap test is an EAS build carrying the entitlement.
+- **React Native / Expo does not change this.** The credential provider is a
+  separate native target in Swift; RN buys the containing app, which the PWA
+  already is, and none of the part that matters.
+- **Android has none of these constraints** and remains technically open —
+  `AutofillService` needs no entitlement, no signing gate, no expiry, and builds
+  on Windows. It is deferred for effort, not blocked.
+
+The PWA is the answer for phones. Effort goes into making copying fast and the
+vault readable, not into chasing an integration the platform will not grant.
 
 ### Phase 4 — Commercial & Growth
 
@@ -130,13 +166,13 @@ A privacy-first identity vault that lets users:
 
 **Workstreams:**
 1. Desktop client (vault browsing, CRUD, artifact review, device approval, recovery, mock plans)
-2. iOS client (SwiftUI shell, Password AutoFill extension, Secure Enclave/keychain)
-3. Android client (native shell, AutofillService, encrypted cache, unlock)
+2. ~~iOS client~~ — not planned, see Phase 3
+3. ~~Android client~~ — not planned, see Phase 3
 4. Mock data services (simulated plans, entitlements, phone/IP products)
 5. QA matrix (cross-client sync, onboarding/recovery, autofill, accessibility, performance, offline)
 6. Finishing touches (empty states, edge copy, store icons, packaging checklists)
 
-**Done when:** Approved PRDs for desktop/iOS/Android, mock service catalog, QA matrix, release checklist.
+**Done when:** Approved PRD for desktop, mock service catalog, QA matrix, release checklist.
 
 ### EPIC-05: Research, Deferred Commercial, Marketing
 
@@ -165,11 +201,12 @@ A privacy-first identity vault that lets users:
 
 | Repo | Purpose |
 |------|---------|
-| `vaultwares-identity-manager` | Browser extension + shared planning anchor |
+| `vaultwares-identity-manager` | Browser extension + mobile PWA + shared planning anchor |
+| `vault-warden` | The vault the clients actually sync to (tailnet-only, on greencloud) |
 | `vaultwares-identity-api` | Account, sync, device, entitlement, orchestration APIs |
 | `vaultwares-identity-desktop` | Desktop companion app |
-| `vaultwares-identity-ios` | iOS app + Password AutoFill extension |
-| `vaultwares-identity-android` | Android app + AutofillService |
+| ~~`vaultwares-identity-ios`~~ | Not planned — see Phase 3 |
+| ~~`vaultwares-identity-android`~~ | Not planned — see Phase 3 |
 | `vaultwares-pipelines` | AI generation and artifact orchestration backend |
 | `vaultwares-website` | Public marketing site |
 
